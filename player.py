@@ -1,6 +1,7 @@
 from typing import Callable, Optional, Any
 import mpv
 
+
 class StreamPlayer:
     def __init__(self, browser_cookies: Optional[str] = None):
         self.browser_cookies = browser_cookies
@@ -12,10 +13,15 @@ class StreamPlayer:
         self._artist: Optional[str] = None
         self._video_enabled: bool = False
         self._is_active_playback: bool = False
+        self.is_stopped: bool = True
+        self._volume: int = 100
+        self._muted: bool = False
 
         # Queue management
         self.queue: list[dict[str, Any]] = []
         self.current_index: int = 0
+        self.repeat_mode: str = "off"  # "off", "all", "one"
+        self.shuffle_enabled: bool = False
 
         self.mpv = self._create_mpv_instance(video_enabled=False)
 
@@ -41,12 +47,14 @@ class StreamPlayer:
         def _idle_observer(_name: str, is_idle: Optional[bool]) -> None:
             if not is_idle:
                 self._is_active_playback = True
+                self.is_stopped = False
             elif is_idle and self._is_active_playback:
-                self._handle_track_ended()
+                if not self.is_stopped:
+                    self._handle_track_ended()
 
         @player.property_observer("time-pos")
         def _time_observer(_name: str, value: Optional[float]) -> None:
-            if value is not None and self._on_time_update and self._is_active_playback:
+            if value is not None and self._on_time_update and self._is_active_playback and not self.is_stopped:
                 try:
                     duration = getattr(player, "duration", 0.0) or 0.0
                 except Exception:
@@ -56,36 +64,40 @@ class StreamPlayer:
         @player.property_observer("media-title")
         def _title_observer(_name: str, value: Optional[str]) -> None:
             self._media_title = value or None
-            if self._on_metadata and self._is_active_playback:
+            if self._on_metadata and self._is_active_playback and not self.is_stopped:
                 self._on_metadata(self._media_title, self._artist)
 
         @player.property_observer("metadata")
         def _metadata_observer(_name: str, value: Optional[dict]) -> None:
             md = value if isinstance(value, dict) else {}
             self._artist = md.get("ARTIST") or md.get("Artist") or md.get("artist")
-            if self._on_metadata and self._is_active_playback:
+            if self._on_metadata and self._is_active_playback and not self.is_stopped:
                 self._on_metadata(self._media_title, self._artist)
 
         @player.event_callback("end-file")
         def _end_observer(_event: dict) -> None:
-            if self._is_active_playback:
+            if self._is_active_playback and not self.is_stopped:
                 self._handle_track_ended()
 
         return player
 
     def _handle_track_ended(self) -> None:
-        if not self._is_active_playback:
+        if not self._is_active_playback or self.is_stopped:
             return
 
-        # Auto-advance to next track in queue if available
-        if self.current_index + 1 < len(self.queue):
-            self.play_next()
-        else:
-            self._is_active_playback = False
-            self._media_title = None
-            self._artist = None
-            if self._on_end:
-                self._on_end()
+        if self.repeat_mode == "one" and len(self.queue) > 0:
+            self.play_index(self.current_index)
+            return
+
+        if self.play_next():
+            return
+
+        self._is_active_playback = False
+        self.is_stopped = True
+        self._media_title = None
+        self._artist = None
+        if self._on_end:
+            self._on_end()
 
     def set_callbacks(
         self,
@@ -111,6 +123,26 @@ class StreamPlayer:
         self.queue.clear()
         self.current_index = 0
 
+    def remove_at(self, index: int) -> bool:
+        if not (0 <= index < len(self.queue)):
+            return False
+        self.queue.pop(index)
+        if self.current_index > index:
+            self.current_index -= 1
+        elif self.current_index >= len(self.queue):
+            self.current_index = max(0, len(self.queue) - 1)
+        return True
+
+    def toggle_shuffle(self) -> bool:
+        self.shuffle_enabled = not self.shuffle_enabled
+        return self.shuffle_enabled
+
+    def cycle_repeat_mode(self) -> str:
+        modes = ["off", "all", "one"]
+        curr_idx = modes.index(self.repeat_mode) if self.repeat_mode in modes else 0
+        self.repeat_mode = modes[(curr_idx + 1) % len(modes)]
+        return self.repeat_mode
+
     def play_index(self, index: int, video_enabled: Optional[bool] = None) -> bool:
         if not (0 <= index < len(self.queue)):
             return False
@@ -127,8 +159,19 @@ class StreamPlayer:
         return True
 
     def play_next(self) -> bool:
+        if not self.queue:
+            return False
+
+        if self.shuffle_enabled and len(self.queue) > 1:
+            import random
+            available = [i for i in range(len(self.queue)) if i != self.current_index]
+            if available:
+                return self.play_index(random.choice(available))
+
         if self.current_index + 1 < len(self.queue):
             return self.play_index(self.current_index + 1)
+        elif self.repeat_mode == "all" and len(self.queue) > 0:
+            return self.play_index(0)
         return False
 
     def play_previous(self) -> bool:
@@ -144,7 +187,30 @@ class StreamPlayer:
             return self.queue[self.current_index]
         return None
 
+    def close_video(self) -> None:
+        """Cleanly terminate the mpv video instance and revert to an audio-only instance."""
+        volume = self.get_volume()
+        muted = self.is_muted()
+        self.stop()
+        if self._video_enabled:
+            try:
+                self.mpv.terminate()
+            except Exception:
+                pass
+            self._video_enabled = False
+            self.mpv = self._create_mpv_instance(video_enabled=False)
+            self.set_volume(volume)
+            if muted:
+                self.mpv.mute = True
+        self.is_stopped = True
+        self._is_active_playback = False
+        self._media_title = None
+        self._artist = None
+        if self._on_end:
+            self._on_end()
+
     def play(self, url: str, video_enabled: bool = False) -> None:
+        self.is_stopped = False
         # Re-initialize instance if video mode changed
         if self._video_enabled != video_enabled:
             volume = self.get_volume()
@@ -167,6 +233,11 @@ class StreamPlayer:
         self._artist = None
         self._is_active_playback = True
 
+        try:
+            self.mpv.pause = False
+        except Exception:
+            pass
+
         self.mpv.play(url)
 
     def pause(self) -> None:
@@ -182,14 +253,17 @@ class StreamPlayer:
             pass
 
     def toggle_pause(self) -> bool:
+        if self.is_stopped or not self._is_active_playback:
+            return False
         try:
-            new_state = not bool(self.mpv.pause)
+            new_state = not bool(getattr(self.mpv, "pause", False))
             self.mpv.pause = new_state
             return new_state
         except Exception:
             return False
 
     def stop(self) -> None:
+        self.is_stopped = True
         self._is_active_playback = False
         self._media_title = None
         self._artist = None
@@ -205,18 +279,21 @@ class StreamPlayer:
             pass
 
     def set_volume(self, level: int) -> int:
-        level = max(0, min(100, int(level)))
+        self._volume = max(0, min(100, int(level)))
         try:
-            self.mpv.volume = level
+            self.mpv.volume = self._volume
         except Exception:
             pass
-        return level
+        return self._volume
 
     def get_volume(self) -> int:
         try:
-            return int(getattr(self.mpv, "volume", 100) or 100)
+            val = getattr(self.mpv, "volume", None)
+            if val is not None:
+                self._volume = max(0, min(100, int(val)))
         except Exception:
-            return 100
+            pass
+        return self._volume
 
     def volume_up(self, step: int = 5) -> int:
         return self.set_volume(self.get_volume() + step)
@@ -225,18 +302,21 @@ class StreamPlayer:
         return self.set_volume(self.get_volume() - step)
 
     def toggle_mute(self) -> bool:
-        muted = not self.is_muted()
+        self._muted = not self.is_muted()
         try:
-            self.mpv.mute = muted
+            self.mpv.mute = self._muted
         except Exception:
             pass
-        return muted
+        return self._muted
 
     def is_muted(self) -> bool:
         try:
-            return bool(getattr(self.mpv, "mute", False))
+            val = getattr(self.mpv, "mute", None)
+            if val is not None:
+                self._muted = bool(val)
         except Exception:
-            return False
+            pass
+        return self._muted
 
     @property
     def video_enabled(self) -> bool:
@@ -244,15 +324,19 @@ class StreamPlayer:
 
     @property
     def is_playing(self) -> bool:
+        if self.is_stopped or not self._is_active_playback:
+            return False
         try:
-            return bool(not self.mpv.core_idle and not self.mpv.pause and self._is_active_playback)
+            return not bool(getattr(self.mpv, "pause", False)) and not bool(getattr(self.mpv, "idle_active", False))
         except Exception:
             return False
 
     @property
     def is_paused(self) -> bool:
+        if self.is_stopped or not self._is_active_playback:
+            return False
         try:
-            return bool(self.mpv.pause and self._is_active_playback)
+            return bool(getattr(self.mpv, "pause", False))
         except Exception:
             return False
 
@@ -279,6 +363,7 @@ class StreamPlayer:
             return 0.0
 
     def cleanup(self) -> None:
+        self.is_stopped = True
         self._is_active_playback = False
         try:
             self.mpv.terminate()
