@@ -1,0 +1,91 @@
+import os
+from typing import Callable, Any, Optional
+import yt_dlp
+
+class YtDownloader:
+    def __init__(self, browser_cookies: Optional[str] = None, download_dir: str = "./downloads"):
+        self.browser_cookies = browser_cookies
+        self.download_dir = download_dir
+        os.makedirs(self.download_dir, exist_ok=True)
+
+    def _get_base_opts(self) -> dict[str, Any]:
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": os.path.join(self.download_dir, "%(title)s.%(ext)s"),
+        }
+        if self.browser_cookies:
+            opts["cookiesfrombrowser"] = (self.browser_cookies,)
+        return opts
+
+    def extract_info(self, url: str) -> dict[str, Any]:
+        opts = self._get_base_opts()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    def get_preset_formats(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "best_video",
+                "label": "Best Video + Best Audio (MP4/MKV)",
+                "format": "bestvideo+bestaudio/best",
+                "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+            },
+            {
+                "id": "1080p",
+                "label": "1080p Video (MP4)",
+                "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+                "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+            },
+            {
+                "id": "720p",
+                "label": "720p Video (MP4)",
+                "format": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+                "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+            },
+            {
+                "id": "mp3",
+                "label": "Audio Only - MP3 (High Quality)",
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+            },
+            {
+                "id": "flac",
+                "label": "Audio Only - FLAC (Lossless)",
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "flac",
+                    }
+                ],
+            },
+        ]
+
+    def download(
+        self,
+        url: str,
+        preset_id: str = "best_video",
+        progress_hook: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> dict[str, Any]:
+        opts = self._get_base_opts()
+
+        preset = next((p for p in self.get_preset_formats() if p["id"] == preset_id), None)
+        if preset:
+            opts["format"] = preset["format"]
+            if "postprocessors" in preset:
+                opts["postprocessors"] = preset["postprocessors"]
+        else:
+            opts["format"] = preset_id
+
+        if progress_hook:
+            opts["progress_hooks"] = [progress_hook]
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
