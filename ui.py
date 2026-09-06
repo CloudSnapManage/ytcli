@@ -1,5 +1,6 @@
 import threading
 from typing import Any, Optional, Callable
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.binding import Binding
@@ -21,6 +22,14 @@ from textual.widgets.option_list import Option
 from textual import events, work
 from yt_downloader import YtDownloader
 from player import StreamPlayer
+from terminal_graphics import (
+    detect_terminal_graphics_support,
+    fetch_thumbnail_image,
+    generate_placeholder_thumbnail,
+    render_half_block_ansi,
+    render_thumbnail,
+    extract_video_id,
+)
 
 
 def format_time(seconds: float) -> str:
@@ -95,6 +104,31 @@ class SearchResultsReady(Message):
     def __init__(self, results: list[dict[str, Any]]) -> None:
         super().__init__()
         self.results = results
+
+
+class ThumbnailReady(Message):
+    """A thumbnail is ready to display.
+
+    ``renderable`` is a Rich ``Text`` with the ANSI half-block copy and is always
+    present (it is the guaranteed-visible base layer). For native terminals
+    (``native=True``) ``path`` additionally holds the cached image file; the
+    crisp native escape sequence is generated on the UI thread at delivery time
+    so it can match the live on-screen size of the box, and is drawn on top of
+    the ANSI base.
+    """
+
+    def __init__(
+        self,
+        video_id: str,
+        renderable: Any,
+        native: bool = False,
+        path: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.video_id = video_id
+        self.renderable = renderable
+        self.native = native
+        self.path = path
 
 
 class YTPlayerApp(App):
@@ -209,6 +243,24 @@ class YTPlayerApp(App):
     #playback_progress {
         width: 1fr;
     }
+    #thumbnail_box {
+        height: auto;
+        width: 100%;
+        margin-top: 1;
+        border-top: solid $primary;
+        display: none;
+    }
+    #thumbnail_title {
+        text-style: bold;
+        color: $accent;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+    #thumbnail_display {
+        height: 13;
+        width: 100%;
+        content-align: center middle;
+    }
     #visualizer_box {
         height: auto;
         width: 100%;
@@ -238,6 +290,7 @@ class YTPlayerApp(App):
         Binding("down", "volume_down", "Vol -5%", priority=True),
         Binding("s", "toggle_shuffle", "Shuffle", priority=True),
         Binding("r", "toggle_repeat", "Repeat", priority=True),
+        Binding("t", "toggle_thumbnail", "Thumbnail", priority=True),
         Binding("v", "toggle_visualizer", "Visualizer", priority=True),
         Binding("c", "close_video", "Close Video", priority=True),
         Binding("escape", "focus_search", "Search", priority=True),
@@ -252,6 +305,14 @@ class YTPlayerApp(App):
         self._vis_levels: list[float] = [0.0] * 16
         self._vis_targets: list[float] = [0.0] * 16
         self._vis_is_flat: bool = False
+        # Native inline-graphics state. _thumbnail_protocol is "kitty" or
+        # "sixel" when the host terminal can render true-pixel thumbnails via
+        # raw escape sequences written straight to the driver; otherwise None
+        # and the ANSI half-block path is used.
+        self._thumbnail_protocol: Optional[str] = None
+        self._native_thumb_path: Optional[str] = None
+        self._native_thumb_escape: Optional[str] = None
+        self._native_thumb_key: Optional[tuple[str, int, int]] = None
         self.player.set_callbacks(
             on_time_update=self._handle_time_update,
             on_end=self.handle_playback_end,
@@ -272,6 +333,10 @@ class YTPlayerApp(App):
     def on_mount(self) -> None:
         table = self.query_one("#results_table", DataTable)
         table.add_columns("#", "Title", "Duration", "Artist / Uploader")
+        detected = detect_terminal_graphics_support().get("protocol")
+        # iTerm2's proprietary inline-image OSC is intentionally left on the
+        # ANSI fallback (it does not overlay cleanly inside a cell-based TUI).
+        self._thumbnail_protocol = detected if detected in ("kitty", "sixel") else None
         self._update_player_bar()
         self._refresh_queue_list()
         self.set_interval(0.08, self._update_visualizer)
@@ -296,6 +361,9 @@ class YTPlayerApp(App):
             with Vertical(id="queue_panel"):
                 yield Static("📋 Queue (Empty)", classes="panel-title", id="queue_title")
                 yield QueueOptionList(id="queue_list")
+                with Vertical(id="thumbnail_box"):
+                    yield Static("🖼 Thumbnail Preview", classes="panel-title", id="thumbnail_title")
+                    yield Static("", id="thumbnail_display")
                 with Vertical(id="visualizer_box"):
                     yield Static("📊 Visualizer", classes="panel-title", id="visualizer_title")
                     yield Static("", id="visualizer_display")
@@ -333,6 +401,10 @@ class YTPlayerApp(App):
             event.stop()
         elif event.key == "c":
             self.action_close_video()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "t":
+            self.action_toggle_thumbnail()
             event.prevent_default()
             event.stop()
         elif event.key == "v":
@@ -396,10 +468,20 @@ class YTPlayerApp(App):
                 self.player.play_index(new_idx, video_enabled=video_enabled)
                 self._refresh_queue_list()
                 self._update_player_bar()
+                self._request_thumbnail_update(item)
                 self.set_focus(None)
                 self.notify(f"Playing: {item.get('title', 'Track')}")
         except Exception as e:
             self.notify(f"Selection error: {e}", severity="error")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            row_idx = int(str(event.row_key.value))
+            if 0 <= row_idx < len(self._search_results):
+                item = self._search_results[row_idx]
+                self._request_thumbnail_update(item)
+        except Exception:
+            pass
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "queue_list":
@@ -408,7 +490,18 @@ class YTPlayerApp(App):
             self.player.play_index(idx, video_enabled=video_enabled)
             self._refresh_queue_list()
             self._update_player_bar()
+            if 0 <= idx < len(self.player.queue):
+                self._request_thumbnail_update(self.player.queue[idx])
             self.set_focus(None)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        try:
+            idx = event.option_index
+            if 0 <= idx < len(self.player.queue):
+                item = self.player.queue[idx]
+                self._request_thumbnail_update(item)
+        except Exception:
+            pass
 
     def on_queue_option_list_track_delete_requested(self, event: QueueOptionList.TrackDeleteRequested) -> None:
         idx = event.index
@@ -538,6 +631,18 @@ class YTPlayerApp(App):
         count = len(self.player.queue)
         header_text = f"📋 Queue ({count} tracks)" if count > 0 else "📋 Queue (Empty)"
         self.query_one("#queue_title", Static).update(header_text)
+        # Growing/shrinking the queue moves the thumbnail box; if a native
+        # overlay is showing, redraw it at its new position after the layout
+        # settles.
+        try:
+            if (
+                self.query_one("#thumbnail_box").display
+                and self._native_thumb_path
+                and self._native_overlay_available()
+            ):
+                self.set_timer(0.03, self._deliver_native_thumbnail)
+        except Exception:
+            pass
 
     def _update_playback_title(self, text: str) -> None:
         for target_id in ("#playback_title", "#player_track_title"):
@@ -620,6 +725,7 @@ class YTPlayerApp(App):
     def on_track_changed(self, event: TrackChanged) -> None:
         self._refresh_queue_list()
         self._update_player_bar()
+        self._request_thumbnail_update(event.track)
 
     def on_time_updated(self, event: TimeUpdated) -> None:
         if getattr(self.player, "is_stopped", False) or not (self.player.is_playing or self.player.is_paused):
@@ -661,6 +767,161 @@ class YTPlayerApp(App):
             self.notify(f"{event.status_text}", severity="information")
         elif event.status_text.startswith("Error"):
             self.notify(f"{event.status_text}", severity="error")
+
+    def on_thumbnail_ready(self, event: ThumbnailReady) -> None:
+        try:
+            # Ignore results arriving after the box has been hidden again; the
+            # fetch/fallback ran on a worker thread and may complete late.
+            if not self.query_one("#thumbnail_box").display:
+                return
+            if event.native and event.path:
+                self._native_thumb_path = event.path
+                self._native_thumb_escape = None
+                self._native_thumb_key = None
+                # Lay the ANSI half-block copy as the base layer first so the box
+                # is never empty: it is Textual-rendered and therefore always
+                # visible. The crisp native image covers this base when it draws.
+                try:
+                    base = event.renderable if event.renderable is not None else ""
+                    self.query_one("#thumbnail_display", Static).update(base)
+                except Exception:
+                    pass
+                # Wait a beat so the base paint has hit the terminal, then draw
+                # the native overlay on top at the live position. The second draw
+                # heals sixel frames if the first landed before that paint.
+                self.set_timer(0.02, self._deliver_native_thumbnail)
+                self.set_timer(0.15, self._deliver_native_thumbnail)
+            else:
+                # A text placeholder: retire any native overlay first.
+                self._clear_native_overlay()
+                thumb_display = self.query_one("#thumbnail_display", Static)
+                thumb_display.update(event.renderable)
+        except Exception:
+            pass
+
+    # -- Native (Kitty / Sixel) thumbnail overlay -----------------------------
+
+    def _native_overlay_available(self) -> bool:
+        """True when raw driver writes for native graphics are possible."""
+        if self._thumbnail_protocol not in ("kitty", "sixel"):
+            return False
+        driver = getattr(self, "_driver", None)
+        return driver is not None and callable(getattr(driver, "write", None))
+
+    def _write_driver_raw(self, data: str) -> bool:
+        """Write raw bytes through Textual's driver (thread-safe writer)."""
+        try:
+            driver = getattr(self, "_driver", None)
+            if driver is None or not callable(getattr(driver, "write", None)):
+                return False
+            driver.write(data)
+            return True
+        except Exception:
+            return False
+
+    def _thumbnail_box_region(self) -> Optional[tuple[int, int, int, int]]:
+        """Absolute (row, col, cols, rows) of the thumbnail area, in cells.
+
+        Uses ``#thumbnail_display`` (the 13-row canvas below the panel title).
+        ``Widget.region`` is in the compositor's screen space (0-based origin at
+        the top-left of the terminal). Returns None if the box is hidden or not
+        yet laid out (e.g. during the first frame).
+        """
+        try:
+            box = self.query_one("#thumbnail_box")
+            if not box.display:
+                return None
+            display = self.query_one("#thumbnail_display", Static)
+            region = display.region
+            if region.width <= 0 or region.height <= 0:
+                return None
+            return (region.y, region.x, region.width, region.height)
+        except Exception:
+            return None
+
+    def _native_diag(self, msg: str) -> None:
+        """Surface a one-time in-app diagnostic for native overlay failures."""
+        try:
+            if getattr(self, "_native_diag_printed", False):
+                return
+            self._native_diag_printed = True
+            self.notify(f"Thumbnail overlay: {msg}", severity="warning")
+        except Exception:
+            pass
+
+    def _deliver_native_thumbnail(self) -> None:
+        """Position the terminal cursor over the box and emit the image escape.
+
+        The escape payload is (re)generated only when the video or the box
+        geometry changes. The box already holds the ANSI half-block base layer
+        from the worker, so a failed native write degrades to that instead of an
+        empty box.
+        """
+        try:
+            if not self._native_overlay_available():
+                return
+            path = self._native_thumb_path
+            if not path:
+                return
+            box = self.query_one("#thumbnail_box")
+            if not box.display:
+                return
+            area = self._thumbnail_box_region()
+            if area is None:
+                return
+            top, left, area_cols, area_rows = area
+            protocol = self._thumbnail_protocol or "kitty"
+            # Bound the encode size to the canvas (display is 13 rows tall).
+            cols = max(8, min(area_cols, 34))
+            rows = max(4, min(area_rows, 13))
+            key = (path, cols, rows)
+            if self._native_thumb_key != key or not self._native_thumb_escape:
+                self._native_thumb_escape = render_thumbnail(
+                    path, protocol=protocol, cols=cols, rows=rows
+                )
+                self._native_thumb_key = key
+            escape = self._native_thumb_escape
+            if not escape:
+                self._native_diag("thumbnail overlay produced no escape")
+                return
+            if escape.lstrip().startswith(("┌", "│")):
+                # The native encode degraded to a plain-text frame (image file
+                # unreadable, Pillow missing, …). The ANSI base layer already
+                # shows the same fallback, so skip the pointless raw write.
+                self._native_diag("thumbnail overlay fell back to a text frame")
+                return
+            # Center the image inside the box content area.
+            col = left + max(0, (area_cols - cols) // 2) + 1
+            row = top + max(0, (area_rows - rows) // 2) + 1
+            ok = self._write_driver_raw(f"\x1b[{row};{col}H{escape}")
+            if not ok:
+                self._native_diag("native overlay write failed (driver unavailable)")
+        except Exception as e:
+            self._native_diag(f"native overlay error: {e!r}")
+
+    def _clear_native_overlay(self) -> None:
+        """Remove any on-screen native overlay (Kitty images persist)."""
+        try:
+            self._native_thumb_path = None
+            self._native_thumb_escape = None
+            self._native_thumb_key = None
+            if self._thumbnail_protocol == "kitty" and self._native_overlay_available():
+                self._write_driver_raw("\x1b_Ga=d,d=1\x1b\\")
+        except Exception:
+            pass
+
+    def on_resize(self, event: events.Resize) -> None:
+        # Any resize/layout change can shift or repaint the thumbnail rows and
+        # erase an overlay; redraw it at the new position.
+        try:
+            if (
+                self.query_one("#thumbnail_box").display
+                and self._native_thumb_path
+                and self._native_overlay_available()
+            ):
+                self.set_timer(0.05, self._deliver_native_thumbnail)
+        except Exception:
+            pass
 
     # Callback bridges invoked by player
     def _handle_track_change(self, index: int, track: dict[str, Any]) -> None:
@@ -729,6 +990,30 @@ class YTPlayerApp(App):
         self._update_player_bar()
         self.notify(f"Repeat: {mode.upper()}")
 
+    def action_toggle_thumbnail(self) -> None:
+        try:
+            thumb_box = self.query_one("#thumbnail_box")
+            thumb_box.display = not thumb_box.display
+            if thumb_box.display:
+                caps = detect_terminal_graphics_support()
+                if not caps["supported"]:
+                    self.notify(
+                        "Terminal does not support native inline graphics. Use Kitty, Ghostty, Foot, or WezTerm for full thumbnails.",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(f"Thumbnail Preview: ON ({caps['terminal_name']})")
+                self._update_highlighted_thumbnail()
+                # The reveal paints the box rows blank; give sixel overlays a
+                # second chance to be drawn above that paint if it landed late.
+                if self._native_overlay_available():
+                    self.set_timer(0.15, self._deliver_native_thumbnail)
+            else:
+                self.notify("Thumbnail Preview: OFF")
+                self._clear_thumbnail()
+        except Exception:
+            pass
+
     def action_toggle_visualizer(self) -> None:
         try:
             vis_box = self.query_one("#visualizer_box")
@@ -737,6 +1022,82 @@ class YTPlayerApp(App):
             self.notify(f"Visualizer: {status}")
             if not vis_box.display:
                 self._clear_visualizer()
+        except Exception:
+            pass
+
+    def _request_thumbnail_update(self, item: dict[str, Any]) -> None:
+        try:
+            thumb_box = self.query_one("#thumbnail_box")
+            if not thumb_box.display:
+                return
+            self.fetch_thumbnail_worker(item)
+        except Exception:
+            pass
+
+    def _update_highlighted_thumbnail(self) -> None:
+        try:
+            # Check results table cursor
+            table = self.query_one("#results_table", DataTable)
+            if table.cursor_row is not None and 0 <= table.cursor_row < len(self._search_results):
+                self._request_thumbnail_update(self._search_results[table.cursor_row])
+                return
+
+            # Check queue list highlighted
+            queue_list = self.query_one("#queue_list", QueueOptionList)
+            if queue_list.highlighted is not None and 0 <= queue_list.highlighted < len(self.player.queue):
+                self._request_thumbnail_update(self.player.queue[queue_list.highlighted])
+                return
+
+            # Check current playing track
+            if self.player.current_track:
+                self._request_thumbnail_update(self.player.current_track)
+        except Exception:
+            pass
+
+    def _clear_thumbnail(self) -> None:
+        try:
+            self._clear_native_overlay()
+            thumb_display = self.query_one("#thumbnail_display", Static)
+            thumb_display.update("")
+        except Exception:
+            pass
+
+    @work(thread=True)
+    def fetch_thumbnail_worker(self, item: dict[str, Any]) -> None:
+        try:
+            title = item.get("title", "No Title")
+            url = item.get("url", "")
+            video_id = item.get("id") or extract_video_id(url)
+            custom_thumb_url = item.get("thumbnail")
+
+            if not video_id:
+                placeholder = generate_placeholder_thumbnail(title, width=34, height=12)
+                self.post_message(ThumbnailReady("", Text.from_ansi(placeholder)))
+                return
+
+            img_path = fetch_thumbnail_image(video_id, custom_url=custom_thumb_url)
+            if img_path:
+                native = self._thumbnail_protocol in ("kitty", "sixel")
+                # Always render the ANSI half-block copy as well. Doing it on this
+                # worker keeps the UI thread light, and the resulting Text is the
+                # guaranteed-visible base layer in #thumbnail_display: it shows no
+                # matter whether the native overlay paints. When the native escape
+                # does display, it draws crisply on top of this base.
+                ansi_str = render_half_block_ansi(img_path, width=34, height=12)
+                if native:
+                    self.post_message(
+                        ThumbnailReady(
+                            video_id,
+                            Text.from_ansi(ansi_str),
+                            native=True,
+                            path=str(img_path),
+                        )
+                    )
+                else:
+                    self.post_message(ThumbnailReady(video_id, Text.from_ansi(ansi_str)))
+            else:
+                placeholder = generate_placeholder_thumbnail(title, width=34, height=12)
+                self.post_message(ThumbnailReady(video_id, Text.from_ansi(placeholder)))
         except Exception:
             pass
 

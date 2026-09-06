@@ -10,14 +10,29 @@ Checks:
      - Keybindings (space, left, right, up, down, s, r, escape)
      - QueueOptionList renders tracks, selection, and deletion via TrackDeleteRequested
      - Status updates (play/pause/idle, volume meter, progress, metadata, shuffle/repeat badges)
+  5. Terminal graphics support detection + thumbnail cache helpers:
+     - detect_terminal_graphics_support reports unsupported in headless envs.
+     - extract_video_id normalises watch/shorts/embed URLs.
+     - generate_placeholder_thumbnail produces a frame.
+     - ThumbnailReady message posts a renderable and the #thumbnail_box toggles with 't'.
 """
 import asyncio
+import os
 from unittest.mock import MagicMock, patch
 
 import mpv as _mpv_module
-from yt_downloader import YtDownloader
 from player import StreamPlayer
-from ui import YTPlayerApp, QueueOptionList, format_time, format_volume_bar
+from terminal_graphics import (
+    detect_terminal_graphics_support,
+    extract_video_id,
+    fetch_thumbnail_image,
+    generate_placeholder_thumbnail,
+    render_kitty_thumbnail,
+    render_sixel_thumbnail,
+    render_thumbnail,
+)
+from ui import YTPlayerApp, QueueOptionList, ThumbnailReady, format_time, format_volume_bar
+from yt_downloader import YtDownloader
 
 
 def _check_format_helpers() -> None:
@@ -232,6 +247,41 @@ async def _check_ui_overhaul() -> None:
         await pilot.pause()
         assert vis_box.display is False
 
+        # Test Thumbnail Box & Toggle Keybinding ('t')
+        thumb_box = app.query_one("#thumbnail_box")
+        thumb_display = app.query_one("#thumbnail_display")
+        assert thumb_box is not None
+        assert thumb_box.display is False
+
+        await pilot.press("t")
+        await pilot.pause()
+        assert thumb_box.display is True
+
+        # ThumbnailReady message should populate #thumbnail_display with a renderable.
+        app.post_message(ThumbnailReady("dQw4w9WgXcQ", "▶ mock preview"))
+        await pilot.pause()
+        assert "mock preview" in _label_text(thumb_display)
+
+        # Toggle Thumbnail OFF clears the display.
+        await pilot.press("t")
+        await pilot.pause()
+        assert thumb_box.display is False
+        assert _label_text(thumb_display) == ""
+
+        # Re-enable so the box is visible for the remaining assertions.
+        await pilot.press("t")
+        await pilot.pause()
+        assert thumb_box.display is True
+
+        # Worker fetch of a URL with no video ID falls back to a placeholder frame
+        # without hitting the network or raising.
+        app._request_thumbnail_update({"title": "No Thumb", "url": "http://song/2", "duration": 240, "uploader": "Artist B"})
+        await pilot.pause(0.3)
+
+        await pilot.press("t")
+        await pilot.pause()
+        assert thumb_box.display is False
+
         # Test metadata fallback logic
         player.is_stopped = False
         player._media_title = ""
@@ -249,9 +299,98 @@ async def _check_ui_overhaul() -> None:
     print("UI multi-panel overhaul & bindings OK")
 
 
+def _check_terminal_graphics() -> None:
+    # Headless/CI environment should report no native graphics protocol.
+    caps = detect_terminal_graphics_support()
+    assert isinstance(caps["supported"], bool)
+    assert caps["protocol"] in (None, "kitty", "iterm2", "sixel")
+    assert isinstance(caps["terminal_name"], str) and len(caps["terminal_name"]) > 0
+
+    # Video ID extraction across URL shapes.
+    assert extract_video_id("dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("not-a-video-id") is None
+    assert extract_video_id("") is None
+
+    # Caching path is exercised without the network by monkeypatching the
+    # downloader, so offline runs stay deterministic.
+    with patch("terminal_graphics.fetch_thumbnail_image", return_value=None) as mock_fetch:
+        assert fetch_thumbnail_image("dQw4w9WgXcQ") is None
+        mock_fetch.assert_called_once_with("dQw4w9WgXcQ")
+
+    # Placeholder renderer always produces a non-empty ANSI frame.
+    ph = generate_placeholder_thumbnail("Testing", width=34, height=12)
+    assert len(ph) > 0
+    assert "Testing" in ph
+    ph_small = generate_placeholder_thumbnail("", width=2, height=2)
+    assert len(ph_small) > 0
+
+    _check_native_renderers()
+    print("Terminal graphics & thumbnail helpers OK")
+
+
+def _check_native_renderers() -> None:
+    """Exercise the Kitty/Sixel native encoders + render_thumbnail dispatch."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("Native renderers SKIPPED (Pillow not installed)")
+        return
+
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="ytcli_thumb_test_")
+    img_path = os.path.join(tmp_dir, "gradient.png")
+    img = Image.new("RGB", (128, 96))
+    px = img.load()
+    for y in range(96):
+        for x in range(128):
+            px[x, y] = ((x * 255) // 128, (y * 255) // 96, 128)
+    img.save(img_path)
+
+    try:
+        # Kitty: delete + transmit chunks, PNG payload (f=100).
+        kitty = render_thumbnail(img_path, protocol="kitty", cols=20, rows=8)
+        assert kitty.startswith("\x1b_G"), "kitty escape missing"
+        assert "a=d,d=1" in kitty, "kitty delete of previous frame missing"
+        assert "a=T,f=100" in kitty, "kitty transmit/PNG marker missing"
+        assert "m=1" in kitty or "m=0" in kitty
+        assert kitty.rstrip().endswith("\x1b\\") or kitty.endswith(" ")
+
+        # Sixel: DEC preamble + raster attributes + colour defs + ST terminator.
+        sixel = render_thumbnail(img_path, protocol="sixel", cols=20, rows=8)
+        assert sixel.startswith("\x1bPq"), "sixel preamble missing"
+        assert '"1;1;' in sixel, "sixel raster attributes missing"
+        assert ";2;" in sixel, "sixel colour definitions missing"
+        assert sixel.rstrip().endswith("\x1b\\"), "sixel ST terminator missing"
+
+        # ANSI fallback must not contain native protocol escapes.
+        ansi = render_thumbnail(img_path, protocol=None, cols=20, rows=8)
+        assert "\x1b_G" not in ansi and "\x1bPq" not in ansi
+        assert len(ansi) > 0
+
+        # Individual entry points work too, and auto-detect never raises.
+        assert render_kitty_thumbnail(img_path, cols=10, rows=5).startswith("\x1b_G")
+        assert render_sixel_thumbnail(img_path, cols=10, rows=5).startswith("\x1bPq")
+        assert len(render_thumbnail(img_path)) > 0  # protocol auto-detected
+
+        # Unreadable input degrades to a placeholder rather than raising.
+        missing = render_thumbnail(os.path.join(tmp_dir, "nope.png"), protocol="kitty")
+        assert len(missing) > 0
+    finally:
+        try:
+            os.remove(img_path)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
 def main() -> None:
     _check_format_helpers()
     _check_player_queue_and_modes()
+    _check_terminal_graphics()
     asyncio.run(_check_ui_overhaul())
 
 

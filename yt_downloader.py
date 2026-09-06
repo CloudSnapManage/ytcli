@@ -55,6 +55,7 @@ class YtDownloader:
             title = entry.get("title") or "Unknown Title"
             duration = float(entry.get("duration") or 0.0)
             uploader = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown"
+            thumb = entry.get("thumbnail") or (f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else "")
 
             items.append({
                 "title": title,
@@ -62,6 +63,7 @@ class YtDownloader:
                 "duration": duration,
                 "uploader": uploader,
                 "id": video_id or "",
+                "thumbnail": thumb,
             })
 
         return items

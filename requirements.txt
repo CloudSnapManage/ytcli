@@ -1,3 +1,5 @@
 yt-dlp>=2024.0.0
 textual>=0.50.0
 python-mpv>=1.0.5
+# Optional: TrueColor ANSI half-block thumbnail rendering (gracefully skipped if absent)
+pillow>=10.0.0
