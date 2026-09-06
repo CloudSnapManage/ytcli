@@ -205,6 +205,33 @@ async def _check_ui_overhaul() -> None:
         await pilot.pause()
         assert player.is_stopped
 
+        # Test Visualizer Box & Toggle Keybinding ('v')
+        vis_box = app.query_one("#visualizer_box")
+        vis_display = app.query_one("#visualizer_display")
+        assert vis_box is not None
+        assert vis_box.display is False
+
+        await pilot.press("v")
+        await pilot.pause()
+        assert vis_box.display is True
+
+        # Test Visualizer Rendering when idle vs playing
+        player.is_stopped = True
+        app._update_visualizer()
+        await pilot.pause()
+
+        player.is_stopped = False
+        player._is_active_playback = True
+        with patch.object(player.mpv, "pause", False), patch.object(player.mpv, "idle_active", False):
+            app._update_visualizer()
+            await pilot.pause()
+            assert len(_label_text(vis_display)) > 0
+
+        # Toggle Visualizer OFF
+        await pilot.press("v")
+        await pilot.pause()
+        assert vis_box.display is False
+
         # Test metadata fallback logic
         player.is_stopped = False
         player._media_title = ""

@@ -209,6 +209,24 @@ class YTPlayerApp(App):
     #playback_progress {
         width: 1fr;
     }
+    #visualizer_box {
+        height: auto;
+        width: 100%;
+        margin-top: 1;
+        border-top: solid $primary;
+        display: none;
+    }
+    #visualizer_title {
+        text-style: bold;
+        color: $accent;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+    #visualizer_display {
+        height: 6;
+        width: 100%;
+        content-align: center middle;
+    }
     """
 
     BINDINGS = [
@@ -220,6 +238,7 @@ class YTPlayerApp(App):
         Binding("down", "volume_down", "Vol -5%", priority=True),
         Binding("s", "toggle_shuffle", "Shuffle", priority=True),
         Binding("r", "toggle_repeat", "Repeat", priority=True),
+        Binding("v", "toggle_visualizer", "Visualizer", priority=True),
         Binding("c", "close_video", "Close Video", priority=True),
         Binding("escape", "focus_search", "Search", priority=True),
         Binding("q", "quit", "Quit", priority=True),
@@ -230,6 +249,9 @@ class YTPlayerApp(App):
         self.downloader = downloader
         self.player = player
         self._search_results: list[dict[str, Any]] = []
+        self._vis_levels: list[float] = [0.0] * 16
+        self._vis_targets: list[float] = [0.0] * 16
+        self._vis_is_flat: bool = False
         self.player.set_callbacks(
             on_time_update=self._handle_time_update,
             on_end=self.handle_playback_end,
@@ -252,6 +274,7 @@ class YTPlayerApp(App):
         table.add_columns("#", "Title", "Duration", "Artist / Uploader")
         self._update_player_bar()
         self._refresh_queue_list()
+        self.set_interval(0.08, self._update_visualizer)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -273,6 +296,9 @@ class YTPlayerApp(App):
             with Vertical(id="queue_panel"):
                 yield Static("📋 Queue (Empty)", classes="panel-title", id="queue_title")
                 yield QueueOptionList(id="queue_list")
+                with Vertical(id="visualizer_box"):
+                    yield Static("📊 Visualizer", classes="panel-title", id="visualizer_title")
+                    yield Static("", id="visualizer_display")
 
         with Vertical(id="player_bar"):
             with Horizontal(classes="player-info-row"):
@@ -307,6 +333,10 @@ class YTPlayerApp(App):
             event.stop()
         elif event.key == "c":
             self.action_close_video()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "v":
+            self.action_toggle_visualizer()
             event.prevent_default()
             event.stop()
         elif event.key == "left":
@@ -698,6 +728,117 @@ class YTPlayerApp(App):
         mode = self.player.cycle_repeat_mode()
         self._update_player_bar()
         self.notify(f"Repeat: {mode.upper()}")
+
+    def action_toggle_visualizer(self) -> None:
+        try:
+            vis_box = self.query_one("#visualizer_box")
+            vis_box.display = not vis_box.display
+            status = "ON" if vis_box.display else "OFF"
+            self.notify(f"Visualizer: {status}")
+            if not vis_box.display:
+                self._clear_visualizer()
+        except Exception:
+            pass
+
+    def _update_visualizer(self) -> None:
+        try:
+            vis_box = self.query_one("#visualizer_box")
+            if not vis_box.display:
+                return
+
+            display = self.query_one("#visualizer_display", Static)
+            is_playing = self.player.is_playing and not getattr(self.player, "is_stopped", False)
+
+            if is_playing:
+                self._render_active_visualizer(display)
+            else:
+                self._render_idle_visualizer(display)
+        except Exception:
+            pass
+
+    def _render_active_visualizer(self, display: Static) -> None:
+        try:
+            import random
+            num_bars = 16
+            max_height = 5
+            if len(self._vis_levels) != num_bars:
+                self._vis_levels = [0.0] * num_bars
+                self._vis_targets = [0.0] * num_bars
+
+            for i in range(num_bars):
+                bias = 1.0 - (i / num_bars) * 0.35
+                if random.random() < 0.3 or self._vis_targets[i] <= 0.2:
+                    self._vis_targets[i] = random.uniform(0.5, max_height) * bias
+
+                target = self._vis_targets[i]
+                current = self._vis_levels[i]
+                if current < target:
+                    self._vis_levels[i] = min(max_height, current + (target - current) * 0.5 + 0.1)
+                else:
+                    self._vis_levels[i] = max(0.0, current - 0.3)
+
+            blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+            row_colors = ["[red]", "[yellow]", "[bright_green]", "[cyan]", "[bright_blue]"]
+            lines: list[str] = []
+            for r in range(max_height - 1, -1, -1):
+                row_chars: list[str] = []
+                color = row_colors[min(r, len(row_colors) - 1)]
+                for val in self._vis_levels:
+                    rem = val - r
+                    if rem <= 0:
+                        char = " "
+                    elif rem >= 1.0:
+                        char = "█"
+                    else:
+                        idx = int(rem * 8)
+                        char = blocks[max(0, min(8, idx))]
+                    row_chars.append(f"{char}{char}")
+                lines.append(f"{color}{' '.join(row_chars)}[/]")
+
+            display.update("\n".join(lines))
+            self._vis_is_flat = False
+        except Exception:
+            pass
+
+    def _render_idle_visualizer(self, display: Static) -> None:
+        try:
+            has_active_levels = any(v > 0.05 for v in self._vis_levels)
+            if has_active_levels:
+                self._vis_levels = [max(0.0, v - 0.5) for v in self._vis_levels]
+                blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+                max_height = 5
+                lines: list[str] = []
+                for r in range(max_height - 1, -1, -1):
+                    row_chars: list[str] = []
+                    for val in self._vis_levels:
+                        rem = val - r
+                        if rem <= 0:
+                            char = " "
+                        elif rem >= 1.0:
+                            char = "█"
+                        else:
+                            idx = int(rem * 8)
+                            char = blocks[max(0, min(8, idx))]
+                        row_chars.append(f"{char}{char}")
+                    lines.append(f"[dim cyan]{' '.join(row_chars)}[/dim cyan]")
+                display.update("\n".join(lines))
+                self._vis_is_flat = False
+            else:
+                if not getattr(self, "_vis_is_flat", False):
+                    baseline = " ".join(["▂▂"] * 16)
+                    display.update(f"\n\n\n\n[dim cyan]{baseline}[/dim cyan]")
+                    self._vis_is_flat = True
+        except Exception:
+            pass
+
+    def _clear_visualizer(self) -> None:
+        try:
+            display = self.query_one("#visualizer_display", Static)
+            display.update("")
+            self._vis_levels = [0.0] * 16
+            self._vis_is_flat = False
+        except Exception:
+            pass
 
     def action_focus_search(self) -> None:
         self.query_one("#search_input", Input).focus()
