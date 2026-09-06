@@ -149,31 +149,31 @@ options:
 ## Screenshots
 
 ### Main Interface & Layout
-![Main Interface](assets/main_interface.png)
+![Main Interface](assets/mainui.png)
 *Clean dashboard layout displaying the search panel, empty queue, thumbnail preview container, and visualizer.*
 
 ### Search & Media Results
-![Search Results](assets/search_results.png)
+![Search Results](assets/search_feature.png)
 *Searching and browsing YouTube videos with inline format selection and result listings.*
 
 ### Media Queue Management
-![Queue View](assets/queue_view.png)
+![Queue View](assets/queue.png)
 *Managing multi-track playback queues with track numbering, titles, and duration details.*
 
 ### Format Selection & Player Controls
-![Player and Format Selection](assets/player_format_selection.png)
+![Player and Format Selection](assets/quality%20selection.png)
 *Selecting video/audio quality formats (MP4, MP3, M4A, FLAC) while reviewing active playback items.*
 
 ### Media Thumbnail Preview
-![Thumbnail Preview](assets/thumbnail_preview.png)
+![Thumbnail Preview](assets/screenshot-2026-09-06_19-49-08.png)
 *High-resolution video cover art rendered directly inside the terminal interface.*
 
 ### Audio Visualizer
-![Audio Visualizer](assets/audio_visualizer.png)
+![Audio Visualizer](assets/screenshot-2026-09-06_18-48-24.png)
 *Real-time equalizer spectrum display during active media playback.*
 
 ### Application Settings
-![Settings Modal](assets/settings_modal.png)
+![Settings Modal](assets/settings_menu.png)
 *Configuring user preferences including search limits, default download directories, auto-play, and startup toggles.*
 
 ## Keybindings
