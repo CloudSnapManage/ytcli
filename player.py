@@ -12,6 +12,7 @@ class StreamPlayer:
         self._media_title: Optional[str] = None
         self._artist: Optional[str] = None
         self._video_enabled: bool = False
+        self._is_loading: bool = False
         self._is_active_playback: bool = False
         self.is_stopped: bool = True
         self._volume: int = 100
@@ -49,9 +50,10 @@ class StreamPlayer:
         @player.property_observer("idle-active")
         def _idle_observer(_name: str, is_idle: Optional[bool]) -> None:
             if not is_idle:
+                self._is_loading = False
                 self._is_active_playback = True
                 self.is_stopped = False
-            elif is_idle and self._is_active_playback:
+            elif is_idle and self._is_active_playback and not self._is_loading:
                 if not self.is_stopped:
                     self._handle_track_ended()
 
@@ -77,15 +79,10 @@ class StreamPlayer:
             if self._on_metadata and self._is_active_playback and not self.is_stopped:
                 self._on_metadata(self._media_title, self._artist)
 
-        @player.event_callback("end-file")
-        def _end_observer(_event: dict) -> None:
-            if self._is_active_playback and not self.is_stopped:
-                self._handle_track_ended()
-
         return player
 
     def _handle_track_ended(self) -> None:
-        if not self._is_active_playback or self.is_stopped:
+        if not self._is_active_playback or self._is_loading or self.is_stopped:
             return
 
         if self.repeat_mode == "one" and len(self.queue) > 0:
@@ -98,6 +95,7 @@ class StreamPlayer:
             return
 
         self._is_active_playback = False
+        self._is_loading = False
         self.is_stopped = True
         self._media_title = None
         self._artist = None
@@ -232,8 +230,12 @@ class StreamPlayer:
             self.mpv = self._create_mpv_instance(video_enabled=False)
             self.set_volume(volume)
             if muted:
-                self.mpv.mute = True
+                try:
+                    self.mpv.mute = True
+                except Exception:
+                    pass
         self.is_stopped = True
+        self._is_loading = False
         self._is_active_playback = False
         self._media_title = None
         self._artist = None
@@ -242,17 +244,26 @@ class StreamPlayer:
 
     def play(self, url: str, video_enabled: bool = False) -> None:
         self.is_stopped = False
+        self._is_loading = True
+        self._is_active_playback = False
+
         # Re-initialize instance if video mode changed
         if self._video_enabled != video_enabled:
             volume = self.get_volume()
             muted = self.is_muted()
             self.stop()
-            self.mpv.terminate()
+            try:
+                self.mpv.terminate()
+            except Exception:
+                pass
             self._video_enabled = video_enabled
             self.mpv = self._create_mpv_instance(video_enabled=video_enabled)
             self.set_volume(volume)
             if muted:
-                self.mpv.mute = True
+                try:
+                    self.mpv.mute = True
+                except Exception:
+                    pass
 
         if not video_enabled:
             self.mpv.ytdl_format = "bestaudio/best"
@@ -262,7 +273,6 @@ class StreamPlayer:
         # Drop metadata cached from the previous file; observers re-populate it.
         self._media_title = None
         self._artist = None
-        self._is_active_playback = True
 
         try:
             self.mpv.pause = False
@@ -284,7 +294,7 @@ class StreamPlayer:
             pass
 
     def toggle_pause(self) -> bool:
-        if self.is_stopped or not self._is_active_playback:
+        if self.is_stopped or (not self._is_active_playback and not self._is_loading):
             return False
         try:
             new_state = not bool(getattr(self.mpv, "pause", False))
@@ -295,6 +305,7 @@ class StreamPlayer:
 
     def stop(self) -> None:
         self.is_stopped = True
+        self._is_loading = False
         self._is_active_playback = False
         self._media_title = None
         self._artist = None
@@ -355,7 +366,11 @@ class StreamPlayer:
 
     @property
     def is_playing(self) -> bool:
-        if self.is_stopped or not self._is_active_playback:
+        if self.is_stopped:
+            return False
+        if self._is_loading:
+            return True
+        if not self._is_active_playback:
             return False
         try:
             return not bool(getattr(self.mpv, "pause", False)) and not bool(getattr(self.mpv, "idle_active", False))
@@ -364,7 +379,7 @@ class StreamPlayer:
 
     @property
     def is_paused(self) -> bool:
-        if self.is_stopped or not self._is_active_playback:
+        if self.is_stopped or (not self._is_active_playback and not self._is_loading):
             return False
         try:
             return bool(getattr(self.mpv, "pause", False))
@@ -395,6 +410,7 @@ class StreamPlayer:
 
     def cleanup(self) -> None:
         self.is_stopped = True
+        self._is_loading = False
         self._is_active_playback = False
         try:
             self.mpv.terminate()
