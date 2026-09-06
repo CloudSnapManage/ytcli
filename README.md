@@ -153,7 +153,7 @@ options:
 *Clean dashboard layout displaying the search panel, empty queue, thumbnail preview container, and visualizer.*
 
 ### Search & Media Results
-![Search Results](assets/search_feature.png)
+![Search Results](assets/example_search.png)
 *Searching and browsing YouTube videos with inline format selection and result listings.*
 
 ### Media Queue Management
@@ -165,11 +165,11 @@ options:
 *Selecting video/audio quality formats (MP4, MP3, M4A, FLAC) while reviewing active playback items.*
 
 ### Media Thumbnail Preview
-![Thumbnail Preview](assets/screenshot-2026-09-06_19-49-08.png)
+![Thumbnail Preview](assets/thumbnail.png)
 *High-resolution video cover art rendered directly inside the terminal interface.*
 
 ### Audio Visualizer
-![Audio Visualizer](assets/screenshot-2026-09-06_18-48-24.png)
+![Audio Visualizer](assets/visualizer.png)
 *Real-time equalizer spectrum display during active media playback.*
 
 ### Application Settings
