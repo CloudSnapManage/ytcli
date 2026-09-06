@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 import mpv
 
 class StreamPlayer:
@@ -7,10 +7,16 @@ class StreamPlayer:
         self._on_time_update: Optional[Callable[[float, float], None]] = None
         self._on_end: Optional[Callable[[], None]] = None
         self._on_metadata: Optional[Callable[[Optional[str], Optional[str]], None]] = None
+        self._on_track_change: Optional[Callable[[int, dict[str, Any]], None]] = None
         self._media_title: Optional[str] = None
         self._artist: Optional[str] = None
         self._video_enabled: bool = False
         self._is_active_playback: bool = False
+
+        # Queue management
+        self.queue: list[dict[str, Any]] = []
+        self.current_index: int = 0
+
         self.mpv = self._create_mpv_instance(video_enabled=False)
 
     def _create_mpv_instance(self, video_enabled: bool = False) -> mpv.MPV:
@@ -20,10 +26,7 @@ class StreamPlayer:
             "vo": "gpu,x11,wl,null" if video_enabled else "null",
             # Automatically stop playback when the stream ends or window closes
             "keep_open": "no",
-            # Native On-Screen Controller + windowed input (takes effect when a
-            # windowed VO is present, i.e. video_enabled=True). mpv's default
-            # window keybindings then drive the same pause/volume/seek state the
-            # terminal TUI controls, so the two stay in sync.
+            # Native On-Screen Controller + windowed input
             "osc": True,
             "osd_bar": True,
             "input_default_bindings": True,
@@ -39,11 +42,7 @@ class StreamPlayer:
             if not is_idle:
                 self._is_active_playback = True
             elif is_idle and self._is_active_playback:
-                self._is_active_playback = False
-                self._media_title = None
-                self._artist = None
-                if self._on_end:
-                    self._on_end()
+                self._handle_track_ended()
 
         @player.property_observer("time-pos")
         def _time_observer(_name: str, value: Optional[float]) -> None:
@@ -70,23 +69,80 @@ class StreamPlayer:
         @player.event_callback("end-file")
         def _end_observer(_event: dict) -> None:
             if self._is_active_playback:
-                self._is_active_playback = False
-                self._media_title = None
-                self._artist = None
-                if self._on_end:
-                    self._on_end()
+                self._handle_track_ended()
 
         return player
+
+    def _handle_track_ended(self) -> None:
+        if not self._is_active_playback:
+            return
+
+        # Auto-advance to next track in queue if available
+        if self.current_index + 1 < len(self.queue):
+            self.play_next()
+        else:
+            self._is_active_playback = False
+            self._media_title = None
+            self._artist = None
+            if self._on_end:
+                self._on_end()
 
     def set_callbacks(
         self,
         on_time_update: Optional[Callable[[float, float], None]] = None,
         on_end: Optional[Callable[[], None]] = None,
         on_metadata: Optional[Callable[[Optional[str], Optional[str]], None]] = None,
+        on_track_change: Optional[Callable[[int, dict[str, Any]], None]] = None,
     ) -> None:
         self._on_time_update = on_time_update
         self._on_end = on_end
         self._on_metadata = on_metadata
+        self._on_track_change = on_track_change
+
+    # Queue Navigation Methods
+    def add_to_queue(self, item: dict[str, Any] | str) -> None:
+        if isinstance(item, str):
+            item_dict = {"title": item, "url": item, "duration": 0.0, "uploader": "Unknown"}
+        else:
+            item_dict = dict(item)
+        self.queue.append(item_dict)
+
+    def clear_queue(self) -> None:
+        self.queue.clear()
+        self.current_index = 0
+
+    def play_index(self, index: int, video_enabled: Optional[bool] = None) -> bool:
+        if not (0 <= index < len(self.queue)):
+            return False
+
+        self.current_index = index
+        track = self.queue[index]
+        url = track.get("url") or ""
+        v_mode = self._video_enabled if video_enabled is None else video_enabled
+
+        self.play(url, video_enabled=v_mode)
+
+        if self._on_track_change:
+            self._on_track_change(self.current_index, track)
+        return True
+
+    def play_next(self) -> bool:
+        if self.current_index + 1 < len(self.queue):
+            return self.play_index(self.current_index + 1)
+        return False
+
+    def play_previous(self) -> bool:
+        if self.current_index > 0 and len(self.queue) > 0:
+            return self.play_index(self.current_index - 1)
+        elif len(self.queue) > 0:
+            return self.play_index(self.current_index)
+        return False
+
+    @property
+    def current_track(self) -> Optional[dict[str, Any]]:
+        if 0 <= self.current_index < len(self.queue):
+            return self.queue[self.current_index]
+        return None
 
     def play(self, url: str, video_enabled: bool = False) -> None:
         # Re-initialize instance if video mode changed
@@ -143,9 +199,8 @@ class StreamPlayer:
             pass
 
     def seek_relative(self, seconds: float) -> None:
-        """Jump forward (``seconds`` > 0) or backward (``seconds`` < 0)."""
         try:
-            self.mpv.seek(seconds)  # relative keyframe seek, matching mpv's default seek
+            self.mpv.seek(seconds)
         except Exception:
             pass
 
@@ -203,12 +258,10 @@ class StreamPlayer:
 
     @property
     def title(self) -> Optional[str]:
-        """Latest ``media-title`` reported by mpv (track/video title)."""
         return self._media_title
 
     @property
     def artist(self) -> Optional[str]:
-        """Latest artist tag from file metadata (``None`` when untagged)."""
         return self._artist
 
     @property

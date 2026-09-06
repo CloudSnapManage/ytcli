@@ -1,7 +1,20 @@
-from typing import Any, Optional
+import threading
+from typing import Any, Optional, Callable
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Input, Button, Label, Select, Switch, ProgressBar, Static
+from textual.message import Message
+from textual.widgets import (
+    Header,
+    Footer,
+    Input,
+    Button,
+    Label,
+    Select,
+    Switch,
+    ProgressBar,
+    Static,
+    DataTable,
+)
 from textual import work
 from yt_downloader import YtDownloader
 from player import StreamPlayer
@@ -13,10 +26,39 @@ def format_time(seconds: float) -> str:
         return f"{hours:02d}:{mins:02d}:{secs:02d}"
     return f"{mins:02d}:{secs:02d}"
 
+# Textual Custom Messages for Thread-Safe UI Communication
+class TrackChanged(Message):
+    def __init__(self, index: int, track: dict[str, Any]) -> None:
+        super().__init__()
+        self.index = index
+        self.track = track
+
+class TimeUpdated(Message):
+    def __init__(self, current: float, total: float) -> None:
+        super().__init__()
+        self.current = current
+        self.total = total
+
+class PlaybackEnded(Message):
+    pass
+
+class MetadataUpdated(Message):
+    def __init__(self, title: Optional[str], artist: Optional[str]) -> None:
+        super().__init__()
+        self.title = title
+        self.artist = artist
+
+class DownloadProgress(Message):
+    def __init__(self, status_text: str, percent: float) -> None:
+        super().__init__()
+        self.status_text = status_text
+        self.percent = percent
+
 class YTPlayerApp(App):
     CSS = """
     Screen {
         layout: vertical;
+        overflow-y: auto;
         padding: 1;
     }
     .box {
@@ -61,6 +103,10 @@ class YTPlayerApp(App):
         width: 100%;
         margin-top: 1;
     }
+    #queue_table {
+        height: 8;
+        width: 100%;
+    }
     """
 
     BINDINGS = [
@@ -72,6 +118,9 @@ class YTPlayerApp(App):
         ("up", "volume_up", "Volume +5%"),
         ("down", "volume_down", "Volume -5%"),
         ("m", "toggle_mute", "Mute"),
+        ("n", "next_track", "Next Track"),
+        ("p", "previous_track", "Prev Track"),
+        ("c", "clear_queue", "Clear Queue"),
     ]
 
     def __init__(self, downloader: YtDownloader, player: StreamPlayer, **kwargs: Any):
@@ -82,10 +131,23 @@ class YTPlayerApp(App):
             on_time_update=self._handle_time_update,
             on_end=self.handle_playback_end,
             on_metadata=self._handle_metadata,
+            on_track_change=self._handle_track_change,
         )
+
+    def _run_on_ui_thread(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        """Execute a callable safely on the main UI thread from any thread."""
+        if threading.get_ident() == getattr(self, "_thread_id", None):
+            fn(*args, **kwargs)
+        else:
+            try:
+                self.call_from_thread(fn, *args, **kwargs)
+            except RuntimeError:
+                pass
 
     def on_mount(self) -> None:
         self._update_volume_label()
+        table = self.query_one("#queue_table", DataTable)
+        table.add_columns("#", "Title", "Duration", "Artist / Uploader")
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -110,6 +172,10 @@ class YTPlayerApp(App):
             yield ProgressBar(id="playback_progress", total=100, show_eta=False)
 
         with Container(classes="box"):
+            yield Static("📋 Playback Queue", classes="section-title")
+            yield DataTable(id="queue_table", cursor_type="row")
+
+        with Container(classes="box"):
             yield Static("⬇️ Download Queue", classes="section-title")
             yield Label("Status: Idle", id="download_status")
             yield ProgressBar(id="download_progress", total=100, show_eta=True)
@@ -127,11 +193,49 @@ class YTPlayerApp(App):
         elif event.button.id == "btn_download":
             self.action_download(url)
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        try:
+            row_idx = int(str(event.row_key.value))
+            video_enabled = self.query_one("#video_toggle", Switch).value
+            self.player.play_index(row_idx, video_enabled=video_enabled)
+            self._refresh_queue_table()
+        except Exception:
+            pass
+
     def action_stream(self, url: str) -> None:
         video_enabled = self.query_one("#video_toggle", Switch).value
         mode_text = "Video" if video_enabled else "Audio Only"
         self.query_one("#playback_title", Label).update(f"Loading stream ({mode_text})...")
-        self.player.play(url, video_enabled=video_enabled)
+        self.stream_worker(url, video_enabled)
+
+    @work(thread=True)
+    def stream_worker(self, url: str, video_enabled: bool) -> None:
+        try:
+            items = self.downloader.extract_playlist_items(url)
+            if not items:
+                items = [{"title": "Media Stream", "url": url, "duration": 0.0, "uploader": "Unknown"}]
+
+            def apply_stream() -> None:
+                self.player.clear_queue()
+                for item in items:
+                    self.player.add_to_queue(item)
+                self.player.play_index(0, video_enabled=video_enabled)
+                self._refresh_queue_table()
+                if len(items) > 1:
+                    self.notify(f"Loaded playlist ({len(items)} tracks)")
+                else:
+                    self.notify("Streaming track")
+
+            self._run_on_ui_thread(apply_stream)
+        except Exception as e:
+            def fallback_stream() -> None:
+                self.player.clear_queue()
+                self.player.add_to_queue({"title": url, "url": url, "duration": 0.0, "uploader": "Unknown"})
+                self.player.play_index(0, video_enabled=video_enabled)
+                self._refresh_queue_table()
+                self.notify(f"Direct stream: {e}", severity="warning")
+
+            self._run_on_ui_thread(fallback_stream)
 
     def action_download(self, url: str) -> None:
         preset_id = str(self.query_one("#quality_select", Select).value)
@@ -139,7 +243,7 @@ class YTPlayerApp(App):
 
     @work(thread=True)
     def download_worker(self, url: str, preset_id: str) -> None:
-        self.call_from_thread(self._update_download_status, "Starting download...", 0.0)
+        self.post_message(DownloadProgress("Starting download...", 0.0))
 
         def progress_hook(d: dict[str, Any]) -> None:
             status = d.get("status")
@@ -151,73 +255,98 @@ class YTPlayerApp(App):
                 eta = d.get("_eta_str", "N/A")
                 filename = d.get("filename", "").split("/")[-1]
                 msg = f"Downloading: {filename} | Speed: {speed} | ETA: {eta}"
-                self.call_from_thread(self._update_download_status, msg, percent)
+                self.post_message(DownloadProgress(msg, percent))
             elif status == "finished":
-                self.call_from_thread(self._update_download_status, "Processing audio/video...", 100.0)
+                self.post_message(DownloadProgress("Processing audio/video...", 100.0))
 
         try:
             self.downloader.download(url, preset_id=preset_id, progress_hook=progress_hook)
-            self.call_from_thread(self._update_download_status, "Download Complete!", 100.0)
-            self.call_from_thread(self.notify, "Download finished successfully!", severity="information")
+            self.post_message(DownloadProgress("Download Complete!", 100.0))
+            self._run_on_ui_thread(self.notify, "Download finished successfully!", severity="information")
         except Exception as e:
-            self.call_from_thread(self._update_download_status, f"Error: {e}", 0.0)
-            self.call_from_thread(self.notify, f"Download failed: {e}", severity="error")
+            self.post_message(DownloadProgress(f"Error: {e}", 0.0))
+            self._run_on_ui_thread(self.notify, f"Download failed: {e}", severity="error")
 
-    def _update_download_status(self, text: str, percent: float) -> None:
-        self.query_one("#download_status", Label).update(f"Status: {text}")
-        bar = self.query_one("#download_progress", ProgressBar)
-        bar.update(progress=percent)
+    def _refresh_queue_table(self) -> None:
+        table = self.query_one("#queue_table", DataTable)
+        table.clear()
+        for idx, item in enumerate(self.player.queue):
+            is_current = (idx == self.player.current_index) and (self.player.is_playing or self.player.is_paused)
+            prefix = "▶ " if is_current else f"{idx + 1}."
+            title = item.get("title", "Unknown Title")
+            dur = float(item.get("duration") or 0.0)
+            dur_str = format_time(dur) if dur > 0 else "--:--"
+            uploader = item.get("uploader", "Unknown")
+            table.add_row(prefix, title, dur_str, uploader, key=str(idx))
 
-    def _handle_time_update(self, current: float, total: float) -> None:
+    # Event Handlers (Textual Message Bus)
+    def on_track_changed(self, event: TrackChanged) -> None:
+        self._refresh_queue_table()
+        title = event.track.get("title") or "Streaming Media"
+        uploader = event.track.get("uploader") or ""
+        display_name = f"{uploader} — {title}" if uploader and uploader != "Unknown" else title
+        self.query_one("#playback_title", Label).update(f"Now Playing: {display_name}")
+
+    def on_time_updated(self, event: TimeUpdated) -> None:
         if not (self.player.is_playing or self.player.is_paused):
             return
-        percent = (current / total * 100) if total > 0 else 0
-        time_text = f"{format_time(current)} / {format_time(total)}"
+        percent = (event.current / event.total * 100) if event.total > 0 else 0
+        time_text = f"{format_time(event.current)} / {format_time(event.total)}"
         track = self._track_label() or "Streaming Media"
+        self.query_one("#playback_title", Label).update(f"Now Playing: {track}")
+        self.query_one("#playback_time", Label).update(time_text)
+        self.query_one("#playback_progress", ProgressBar).update(progress=percent)
 
-        def update_ui() -> None:
-            if not (self.player.is_playing or self.player.is_paused):
-                return
+    def on_playback_ended(self, event: PlaybackEnded) -> None:
+        self.query_one("#playback_title", Label).update("Now Playing: Idle")
+        self.query_one("#playback_time", Label).update("00:00 / 00:00")
+        self.query_one("#playback_progress", ProgressBar).update(progress=0)
+        self._refresh_queue_table()
+
+    def on_metadata_updated(self, event: MetadataUpdated) -> None:
+        if not (self.player.is_playing or self.player.is_paused):
+            return
+        track = self._track_label()
+        if track:
             self.query_one("#playback_title", Label).update(f"Now Playing: {track}")
-            self.query_one("#playback_time", Label).update(time_text)
-            self.query_one("#playback_progress", ProgressBar).update(progress=percent)
 
-        self.call_from_thread(update_ui)
+    def on_download_progress(self, event: DownloadProgress) -> None:
+        self.query_one("#download_status", Label).update(f"Status: {event.status_text}")
+        self.query_one("#download_progress", ProgressBar).update(progress=event.percent)
+
+    # Callback bridges invoked by player / downloader
+    def _handle_track_change(self, index: int, track: dict[str, Any]) -> None:
+        self.post_message(TrackChanged(index, track))
+
+    def _handle_time_update(self, current: float, total: float) -> None:
+        self.post_message(TimeUpdated(current, total))
 
     def handle_playback_end(self) -> None:
-        def reset_ui() -> None:
-            self.query_one("#playback_title", Label).update("Now Playing: Idle")
-            self.query_one("#playback_time", Label).update("00:00 / 00:00")
-            self.query_one("#playback_progress", ProgressBar).update(progress=0)
-
-        self.call_from_thread(reset_ui)
+        self.post_message(PlaybackEnded())
 
     def _handle_playback_end(self) -> None:
         self.handle_playback_end()
 
-    def _handle_metadata(self, _title: Optional[str], _artist: Optional[str]) -> None:
-        if not (self.player.is_playing or self.player.is_paused):
-            return
-        track = self._track_label()
-        if not track:
-            return
-
-        def update_ui() -> None:
-            if not (self.player.is_playing or self.player.is_paused):
-                return
-            self.query_one("#playback_title", Label).update(f"Now Playing: {track}")
-
-        self.call_from_thread(update_ui)
+    def _handle_metadata(self, title: Optional[str], artist: Optional[str]) -> None:
+        self.post_message(MetadataUpdated(title, artist))
 
     def _track_label(self) -> Optional[str]:
-        """Human-readable track label (``Artist — Title``) from mpv metadata."""
         title = (self.player.title or "").strip()
         if title.lower().startswith(("http://", "https://", "www.")):
             title = ""
         artist = (self.player.artist or "").strip()
         if title and artist:
             return f"{artist} — {title}"
-        return title or artist or None
+        if title or artist:
+            return title or artist
+        curr = self.player.current_track
+        if curr:
+            q_title = curr.get("title") or ""
+            q_uploader = curr.get("uploader") or ""
+            if q_title and q_uploader and q_uploader != "Unknown":
+                return f"{q_uploader} — {q_title}"
+            return q_title or q_uploader or None
+        return None
 
     def action_toggle_pause(self) -> None:
         if self.player.is_playing or self.player.is_paused:
@@ -255,6 +384,25 @@ class YTPlayerApp(App):
         muted = self.player.toggle_mute()
         self._update_volume_label()
         self.notify("Muted" if muted else "Unmuted")
+
+    def action_next_track(self) -> None:
+        if self.player.play_next():
+            self._refresh_queue_table()
+            self.notify("Skipped to next track")
+        else:
+            self.notify("End of queue reached", severity="information")
+
+    def action_previous_track(self) -> None:
+        if self.player.play_previous():
+            self._refresh_queue_table()
+            self.notify("Replaying previous track")
+        else:
+            self.notify("Start of queue reached", severity="information")
+
+    def action_clear_queue(self) -> None:
+        self.player.clear_queue()
+        self._refresh_queue_table()
+        self.notify("Playback queue cleared")
 
     def _update_volume_label(self) -> None:
         level = self.player.get_volume()

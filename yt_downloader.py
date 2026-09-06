@@ -23,6 +23,49 @@ class YtDownloader:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
+    def extract_playlist_items(self, url: str) -> list[dict[str, Any]]:
+        """Parse YouTube/YT Music playlist or video URLs using extract_flat=True.
+
+        Returns a list of track metadata dictionaries with keys:
+        ``title``, ``url``, ``duration``, and ``uploader``.
+        """
+        opts = self._get_base_opts()
+        opts["extract_flat"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+
+        raw_entries = info.get("entries")
+        if raw_entries is not None:
+            entries = list(raw_entries)
+        else:
+            entries = [info]
+
+        items: list[dict[str, Any]] = []
+        for entry in entries:
+            if not entry:
+                continue
+            entry_url = entry.get("url") or entry.get("webpage_url")
+            video_id = entry.get("id")
+            if not entry_url or not str(entry_url).startswith("http"):
+                if video_id:
+                    entry_url = f"https://www.youtube.com/watch?v={video_id}"
+                else:
+                    entry_url = url
+
+            title = entry.get("title") or "Unknown Title"
+            duration = float(entry.get("duration") or 0.0)
+            uploader = entry.get("uploader") or entry.get("channel") or entry.get("artist") or "Unknown"
+
+            items.append({
+                "title": title,
+                "url": entry_url,
+                "duration": duration,
+                "uploader": uploader,
+                "id": video_id or "",
+            })
+
+        return items
+
     def get_preset_formats(self) -> list[dict[str, Any]]:
         return [
             {
