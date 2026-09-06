@@ -59,6 +59,20 @@ brew install python mpv yt-dlp ffmpeg
 
 ## Installation
 
+### Fast Install (Recommended)
+
+Install globally in an isolated environment using `pipx`:
+
+```bash
+pipx install git+https://github.com/CloudSnapManage/ytcli.git
+```
+
+Then run the application directly from anywhere in your terminal:
+
+```bash
+ytcli
+```
+
 ### Arch Linux (AUR)
 
 If you are using an AUR helper such as `yay` or `paru`:
@@ -77,7 +91,7 @@ paru -S ytcli
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/shrijan/ytcli.git
+git clone https://github.com/CloudSnapManage/ytcli.git
 cd ytcli
 ```
 
@@ -87,19 +101,25 @@ python -m venv venv
 source venv/bin/activate
 ```
 
-3. Install the required Python packages:
+3. Install the package and dependencies:
 ```bash
-pip install -r requirements.txt
+pip install .
 ```
 
-4. Alternatively, install in editable mode:
+Alternatively, install in editable mode for development:
 ```bash
 pip install -e .
 ```
 
 ## Usage
 
-Start the player from your terminal:
+Start the player from anywhere in your terminal:
+
+```bash
+ytcli
+```
+
+Or run directly from the source directory:
 
 ```bash
 python main.py
@@ -108,7 +128,7 @@ python main.py
 ### Command-Line Options
 
 ```text
-usage: main.py [-h] [-c COOKIES] [-d DIR]
+usage: ytcli [-h] [-c COOKIES] [-d DIR]
 
 yt-cli-player: Terminal-based YouTube/YT Music Player & Downloader
 
