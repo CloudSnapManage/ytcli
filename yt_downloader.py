@@ -8,6 +8,11 @@ class YtDownloader:
         self.download_dir = download_dir
         os.makedirs(self.download_dir, exist_ok=True)
 
+    def set_download_dir(self, path: str) -> None:
+        """Switch the output directory at runtime (e.g. from the settings panel)."""
+        self.download_dir = path
+        os.makedirs(self.download_dir, exist_ok=True)
+
     def _get_base_opts(self) -> dict[str, Any]:
         opts: dict[str, Any] = {
             "quiet": True,
@@ -101,6 +106,18 @@ class YtDownloader:
                 ],
             },
             {
+                "id": "m4a",
+                "label": "Audio Only - M4A (AAC)",
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "m4a",
+                        "preferredquality": "192",
+                    }
+                ],
+            },
+            {
                 "id": "flac",
                 "label": "Audio Only - FLAC (Lossless)",
                 "format": "bestaudio/best",
@@ -131,6 +148,13 @@ class YtDownloader:
 
         if progress_hook:
             opts["progress_hooks"] = [progress_hook]
+
+        # The output dir may have been switched at runtime via settings; make
+        # sure it exists before yt-dlp writes into it.
+        try:
+            os.makedirs(self.download_dir, exist_ok=True)
+        except OSError:
+            pass
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=True)

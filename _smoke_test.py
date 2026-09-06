@@ -115,7 +115,9 @@ def _check_player_queue_and_modes() -> None:
 async def _check_ui_overhaul() -> None:
     downloader = YtDownloader(download_dir="./downloads")
     player = StreamPlayer()
-    app = YTPlayerApp(downloader=downloader, player=player)
+    # load_config_file=False keeps tests hermetic: no reads/writes of the real
+    # ~/.config/ytcli/config.json and deterministic startup toggles.
+    app = YTPlayerApp(downloader=downloader, player=player, load_config_file=False)
 
     async with app.run_test() as pilot:
         # Check presence of multi-panel widgets
@@ -299,6 +301,39 @@ async def _check_ui_overhaul() -> None:
     print("UI multi-panel overhaul & bindings OK")
 
 
+async def _check_no_config_io() -> None:
+    """With load_config_file=False the app must never touch the user's config."""
+    downloader = YtDownloader(download_dir="./downloads")
+    player = StreamPlayer()
+    try:
+        with patch("ui.config.load_config") as mock_load, patch("ui.config.save_config") as mock_save:
+            app = YTPlayerApp(downloader=downloader, player=player, load_config_file=False)
+            async with app.run_test() as pilot:
+                # A result round-trip would normally persist search history, and a
+                # settings save would write to disk — neither may happen here.
+                app.on_search_results_ready(
+                    MagicMock(results=[{"title": "T", "url": "http://u", "duration": 1.0, "uploader": "U"}])
+                )
+                await pilot.pause()
+                app._on_settings_dismissed(
+                    {
+                        "search_results_count": 10,
+                        "default_format": "best_video",
+                        "download_dir": str(downloader.download_dir),
+                        "startup": {"thumbnails": False, "visualizer": False, "autoplay_next": True},
+                        "toast_duration": 3.0,
+                        "search_history": ["T"],
+                    }
+                )
+                await pilot.pause()
+            # Leaving the run_test context triggers on_unmount (cleanup + save).
+            assert mock_load.call_count == 0, "config must not be read with load_config_file=False"
+            assert mock_save.call_count == 0, "config must not be written with load_config_file=False"
+    finally:
+        player.cleanup()
+    print("No-config-I/O guard OK")
+
+
 def _check_terminal_graphics() -> None:
     # Headless/CI environment should report no native graphics protocol.
     caps = detect_terminal_graphics_support()
@@ -392,6 +427,7 @@ def main() -> None:
     _check_player_queue_and_modes()
     _check_terminal_graphics()
     asyncio.run(_check_ui_overhaul())
+    asyncio.run(_check_no_config_io())
 
 
 if __name__ == "__main__":

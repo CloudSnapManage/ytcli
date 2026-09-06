@@ -22,6 +22,9 @@ class StreamPlayer:
         self.current_index: int = 0
         self.repeat_mode: str = "off"  # "off", "all", "one"
         self.shuffle_enabled: bool = False
+        # When False, playback stops at the end of the current track instead of
+        # advancing to the next one in the queue (repeat-mode "one" still loops).
+        self.autoplay_next: bool = True
 
         self.mpv = self._create_mpv_instance(video_enabled=False)
 
@@ -89,7 +92,9 @@ class StreamPlayer:
             self.play_index(self.current_index)
             return
 
-        if self.play_next():
+        # Advance to the next track only when auto-advance is enabled; otherwise
+        # playback stops here (the repeat-mode "all" wrap is part of advancing).
+        if self.autoplay_next and self.play_next():
             return
 
         self._is_active_playback = False
@@ -122,6 +127,32 @@ class StreamPlayer:
     def clear_queue(self) -> None:
         self.queue.clear()
         self.current_index = 0
+
+    def snapshot_items(self) -> list[dict[str, Any]]:
+        """Return a deep-ish copy of the queue suitable for serialising."""
+        return [dict(item) for item in self.queue]
+
+    def load_items(self, items: list[dict[str, Any]]) -> int:
+        """Replace the queue with imported tracks. Returns how many were loaded."""
+        parsed: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            track = dict(item)
+            url = str(track.get("url") or "").strip()
+            if not url:
+                url = str(track.get("title") or "").strip()
+            if not url:
+                continue
+            track["url"] = url
+            track["title"] = str(track.get("title") or url)
+            track["duration"] = float(track.get("duration") or 0.0)
+            track["uploader"] = str(track.get("uploader") or "Unknown")
+            parsed.append(track)
+        if parsed:
+            self.clear_queue()
+            self.queue.extend(parsed)
+        return len(parsed)
 
     def remove_at(self, index: int) -> bool:
         if not (0 <= index < len(self.queue)):

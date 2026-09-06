@@ -1,10 +1,14 @@
+import json
+import os
 import threading
+import time
 from typing import Any, Optional, Callable
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.binding import Binding
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import (
     Header,
     Footer,
@@ -20,6 +24,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 from textual import events, work
+import config
 from yt_downloader import YtDownloader
 from player import StreamPlayer
 from terminal_graphics import (
@@ -131,6 +136,218 @@ class ThumbnailReady(Message):
         self.path = path
 
 
+class ConfigLoaded(Message):
+    """Settings successfully read from disk (delivered on the UI thread)."""
+
+    def __init__(self, settings: dict[str, Any]) -> None:
+        super().__init__()
+        self.settings = settings
+
+
+class QueueImportReady(Message):
+    """A playlist file was parsed off-thread; items are ready to load."""
+
+    def __init__(self, items: list[dict[str, Any]], source: str) -> None:
+        super().__init__()
+        self.items = items
+        self.source = source
+
+
+# -- Queue serialisation helpers (pure, callable from worker threads) --------
+
+def _queue_to_json(items: list[dict[str, Any]]) -> str:
+    return json.dumps(items, indent=2, ensure_ascii=False)
+
+
+def _queue_to_m3u(items: list[dict[str, Any]]) -> str:
+    lines = ["#EXTM3U"]
+    for item in items:
+        dur = int(float(item.get("duration") or 0.0))
+        title = str(item.get("title") or "Unknown Title").replace("\n", " ").replace("\r", "")
+        lines.append(f"#EXTINF:{dur},{title}")
+        lines.append(str(item.get("url") or ""))
+    return "\n".join(lines) + "\n"
+
+
+def _parse_m3u_text(text: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    title = ""
+    duration = 0.0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#EXTM3U"):
+            continue
+        if line.startswith("#EXTINF:"):
+            meta = line[len("#EXTINF:") :]
+            if "," in meta:
+                dur_part, title_part = meta.split(",", 1)
+                try:
+                    duration = max(0.0, float(dur_part.strip()))
+                except ValueError:
+                    duration = 0.0
+                title = title_part.strip()
+            continue
+        if line.startswith("#"):
+            continue
+        url = line
+        if url:
+            items.append(
+                {
+                    "title": title or url,
+                    "url": url,
+                    "duration": duration,
+                    "uploader": "Unknown",
+                }
+            )
+            title = ""
+            duration = 0.0
+    return items
+
+
+class SettingsScreen(ModalScreen):
+    """Modal settings panel. ``dismiss()`` returns the edited settings dict
+    (or ``None`` when cancelled)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    CSS = """
+    #settings_panel {
+        width: 78;
+        max-height: 90%;
+        padding: 1 2;
+        background: $surface;
+        border: heavy $primary;
+        margin: 1 4;
+        layer: modal;
+    }
+    #settings_panel .s-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #settings_panel .s-caption {
+        color: $text-muted;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+    #settings_panel .s-row {
+        height: auto;
+        width: 100%;
+        layout: horizontal;
+        align-vertical: middle;
+        margin-bottom: 1;
+    }
+    #settings_panel .s-row Label {
+        width: 34;
+        min-width: 34;
+        text-style: bold;
+    }
+    #settings_panel Select,
+    #settings_panel Input {
+        width: 1fr;
+    }
+    #settings_actions {
+        height: auto;
+        width: 100%;
+        layout: horizontal;
+        align-horizontal: right;
+        margin-top: 1;
+    }
+    #settings_actions Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        preset_options: list[tuple[str, str]],
+    ) -> None:
+        super().__init__()
+        self._settings = settings
+        self._preset_options = preset_options or []
+        preset_ids = [pid for (_label, pid) in self._preset_options]
+        count = int(settings.get("search_results_count", 10))
+        self._init_count = count if count in (5, 10, 20, 50) else 10
+        fmt = str(settings.get("default_format", "best_video"))
+        self._init_format = fmt if fmt in preset_ids else (preset_ids[0] if preset_ids else "best_video")
+        toast = float(settings.get("toast_duration", 3.0))
+        self._init_toast = toast if toast in (1, 2, 3, 5, 8) else 3.0
+
+    def _collect(self) -> dict[str, Any]:
+        startup = dict(self._settings.get("startup") or {})
+        startup["thumbnails"] = self.query_one("#set_thumb", Switch).value
+        startup["visualizer"] = self.query_one("#set_vis", Switch).value
+        startup["autoplay_next"] = self.query_one("#set_autoplay", Switch).value
+        fmt = str(self.query_one("#set_format", Select).value)
+        preset_ids = [pid for (_label, pid) in self._preset_options]
+        return {
+            "search_results_count": int(self.query_one("#set_count", Select).value),
+            "default_format": fmt if fmt in preset_ids else "best_video",
+            "download_dir": str(self.query_one("#set_dir", Input).value).strip(),
+            "startup": startup,
+            "toast_duration": float(self.query_one("#set_toast", Select).value),
+            "search_history": list(self._settings.get("search_history") or []),
+        }
+
+    def compose(self) -> ComposeResult:
+        startup = self._settings.get("startup") or {}
+        with Vertical(id="settings_panel"):
+            yield Static("⚙ Settings", classes="s-title")
+            with Horizontal(classes="s-row"):
+                yield Label("Search results per query")
+                yield Select(
+                    options=[(f"{n} results", n) for n in (5, 10, 20, 50)],
+                    value=self._init_count,
+                    id="set_count",
+                    allow_blank=False,
+                )
+            with Horizontal(classes="s-row"):
+                yield Label("Default media format")
+                yield Select(
+                    options=self._preset_options,
+                    value=self._init_format,
+                    id="set_format",
+                    allow_blank=False,
+                )
+            with Horizontal(classes="s-row"):
+                yield Label("Download output directory")
+                yield Input(value=str(self._settings.get("download_dir", "")), id="set_dir")
+            yield Static("Startup toggles (applied when the app starts)", classes="s-caption")
+            with Horizontal(classes="s-row"):
+                yield Label("Start with thumbnails visible")
+                yield Switch(value=bool(startup.get("thumbnails", False)), id="set_thumb")
+            with Horizontal(classes="s-row"):
+                yield Label("Start with visualizer visible")
+                yield Switch(value=bool(startup.get("visualizer", False)), id="set_vis")
+            with Horizontal(classes="s-row"):
+                yield Label("Auto-play next track")
+                yield Switch(value=bool(startup.get("autoplay_next", True)), id="set_autoplay")
+            with Horizontal(classes="s-row"):
+                yield Label("Toast notification duration")
+                yield Select(
+                    options=[(f"{n}s", float(n)) for n in (1, 2, 3, 5, 8)],
+                    value=self._init_toast,
+                    id="set_toast",
+                    allow_blank=False,
+                )
+            with Horizontal(id="settings_actions"):
+                yield Button("Save", variant="primary", id="btn_save_settings")
+                yield Button("Cancel", id="btn_cancel_settings")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn_save_settings":
+            try:
+                self.dismiss(self._collect())
+            except Exception as e:
+                self.notify(f"Settings error: {e}", severity="error")
+        elif event.button.id == "btn_cancel_settings":
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class YTPlayerApp(App):
     CSS = """
     Screen {
@@ -177,6 +394,14 @@ class YTPlayerApp(App):
     #results_table {
         height: 1fr;
         width: 100%;
+    }
+    #results_stats {
+        height: auto;
+        width: 100%;
+        color: $text-muted;
+        text-style: italic;
+        margin-top: 1;
+        margin-bottom: 1;
     }
     #queue_list {
         height: 1fr;
@@ -282,12 +507,14 @@ class YTPlayerApp(App):
     """
 
     BINDINGS = [
-        Binding("space", "toggle_pause", "Play/Pause", priority=True),
         Binding("x", "stop", "Stop", priority=True),
         Binding("left", "seek_backward", "Seek -5s", priority=True),
         Binding("right", "seek_forward", "Seek +5s", priority=True),
-        Binding("up", "volume_up", "Vol +5%", priority=True),
-        Binding("down", "volume_down", "Vol -5%", priority=True),
+        # Up/Down adjust volume everywhere except the search box, where they
+        # recall previous searches. Routed through dispatchers so the behaviour
+        # follows the focused widget (mirrors the contextual space key below).
+        Binding("up", "arrow_up", "Vol ↑ / Search history", priority=True),
+        Binding("down", "arrow_down", "Vol ↓ / Search history", priority=True),
         Binding("s", "toggle_shuffle", "Shuffle", priority=True),
         Binding("r", "toggle_repeat", "Repeat", priority=True),
         Binding("t", "toggle_thumbnail", "Thumbnail", priority=True),
@@ -295,12 +522,44 @@ class YTPlayerApp(App):
         Binding("c", "close_video", "Close Video", priority=True),
         Binding("escape", "focus_search", "Search", priority=True),
         Binding("q", "quit", "Quit", priority=True),
+        # Multi-selection & batch actions (search results table). Space is
+        # contextual: selecting a highlighted row when the results table is
+        # focused, play/pause everywhere else.
+        Binding("space", "space_action", "Play/Pause or Select Row", priority=True),
+        Binding("m", "toggle_mark_current", "Select Row"),
+        Binding("ctrl+a", "select_all_rows", "Select All"),
+        Binding("u", "unselect_all_rows", "Clear Selection"),
+        Binding("ctrl+d", "unselect_all_rows", "Clear Selection"),
+        Binding("a", "add_marked_to_queue", "Add Selected"),
+        Binding("d", "download_selected", "Download Selected"),
+        # Power features.
+        Binding("S", "toggle_settings", "Settings"),
+        Binding("ctrl+s", "toggle_settings", "Settings"),
+        Binding("ctrl+e", "export_queue", "Export Queue"),
+        Binding("ctrl+i", "import_queue", "Import Queue"),
     ]
 
-    def __init__(self, downloader: YtDownloader, player: StreamPlayer, **kwargs: Any):
+    def __init__(
+        self,
+        downloader: YtDownloader,
+        player: StreamPlayer,
+        load_config_file: bool = True,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         self.downloader = downloader
         self.player = player
+        # Tests pass load_config_file=False so they never read/write the real
+        # user configuration and startup toggles stay deterministic.
+        self._load_config_file = load_config_file
+        # Settings, asynchronously merged with ~/.config/ytcli/config.json.
+        self._settings: dict[str, Any] = config.default_config()
+        self._search_count: int = int(self._settings.get("search_results_count", 10))
+        self._toast_duration: Optional[float] = float(self._settings.get("toast_duration", 3.0))
+        self._search_history: list[str] = list(self._settings.get("search_history") or [])
+        self._hist_index: Optional[int] = None
+        # Multi-selection state over the current search results (row indexes).
+        self._marked: set[int] = set()
         self._search_results: list[dict[str, Any]] = []
         self._vis_levels: list[float] = [0.0] * 16
         self._vis_targets: list[float] = [0.0] * 16
@@ -319,6 +578,20 @@ class YTPlayerApp(App):
             on_metadata=self._handle_metadata,
             on_track_change=self._handle_track_change,
         )
+
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: str = "information",
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Honor the configured toast duration unless a caller overrides it."""
+        if timeout is None:
+            timeout = getattr(self, "_toast_duration", None)
+        super().notify(message, title=title, severity=severity, timeout=timeout, **kwargs)
 
     def _run_on_ui_thread(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Execute a callable safely on the main UI thread from any thread."""
@@ -339,6 +612,11 @@ class YTPlayerApp(App):
         self._thumbnail_protocol = detected if detected in ("kitty", "sixel") else None
         self._update_player_bar()
         self._refresh_queue_list()
+        self._update_results_stats()
+        # Persisted settings are loaded off the UI thread; defaults already
+        # apply, so the app is usable immediately either way.
+        if self._load_config_file:
+            self.config_load_worker()
         self.set_interval(0.08, self._update_visualizer)
 
     def compose(self) -> ComposeResult:
@@ -352,10 +630,15 @@ class YTPlayerApp(App):
                     yield Switch(id="video_toggle", value=False)
                     yield Label("Format:")
                     preset_options = [(p["label"], p["id"]) for p in self.downloader.get_preset_formats()]
-                    yield Select(options=preset_options, value="best_video", id="quality_select", allow_blank=False)
+                    preset_ids = [pid for (_label, pid) in preset_options]
+                    default_fmt = self._settings.get("default_format", "best_video")
+                    if default_fmt not in preset_ids and preset_ids:
+                        default_fmt = preset_ids[0]
+                    yield Select(options=preset_options, value=default_fmt, id="quality_select", allow_blank=False)
                     yield Button("Search", variant="primary", id="btn_search")
                     yield Button("Add All", variant="default", id="btn_add_all")
                     yield Button("Download", variant="success", id="btn_download")
+                yield Static("", id="results_stats")
                 yield DataTable(id="results_table", cursor_type="row")
 
             with Vertical(id="queue_panel"):
@@ -392,7 +675,7 @@ class YTPlayerApp(App):
             return
 
         if event.key == "space":
-            self.action_toggle_pause()
+            self.action_space_action()
             event.prevent_default()
             event.stop()
         elif event.key == "x":
@@ -520,14 +803,15 @@ class YTPlayerApp(App):
             self.notify("Please enter a search query or URL.", severity="warning")
             return
         self.notify("Searching / extracting media...")
-        self.search_worker(query)
+        count = int(getattr(self, "_search_count", 10) or 10)
+        self.search_worker(query, count)
 
     @work(thread=True)
-    def search_worker(self, query: str) -> None:
+    def search_worker(self, query: str, count: int = 10) -> None:
         try:
             url_or_query = query
             if not (query.startswith("http://") or query.startswith("https://") or query.startswith("ytsearch")):
-                url_or_query = f"ytsearch10:{query}"
+                url_or_query = f"ytsearch{max(1, min(100, count))}:{query}"
 
             items = self.downloader.extract_playlist_items(url_or_query)
             if not items:
@@ -551,19 +835,362 @@ class YTPlayerApp(App):
         self._update_player_bar()
         self.notify(f"Added {len(self._search_results)} tracks to queue")
 
-    def _action_download_selected(self) -> None:
-        table = self.query_one("#results_table", DataTable)
-        url = ""
-        if table.cursor_row is not None and 0 <= table.cursor_row < len(self._search_results):
-            url = self._search_results[table.cursor_row].get("url") or ""
-        if not url:
-            url = self.query_one("#search_input", Input).value.strip()
-        if not url:
-            self.notify("Select a search result or enter a URL to download.", severity="warning")
-            return
+    # -- Search results: rendering & multi-selection --------------------------
 
+    def _refresh_results_table(self) -> None:
+        """Rebuild the results DataTable, preserving the highlighted row."""
+        try:
+            table = self.query_one("#results_table", DataTable)
+            cursor = table.cursor_row
+            if not isinstance(cursor, int) or not (0 <= cursor < len(self._search_results)):
+                cursor = None
+            table.clear()
+            for idx, item in enumerate(self._search_results):
+                title = str(item.get("title", "Unknown Title"))
+                dur = float(item.get("duration") or 0.0)
+                dur_str = format_time(dur) if dur > 0 else "--:--"
+                uploader = str(item.get("uploader", "Unknown"))
+                check = "✓ " if idx in self._marked else ""
+                table.add_row(f"{check}{idx + 1}", title, dur_str, uploader, key=str(idx))
+            if cursor is not None and 0 <= cursor < len(self._search_results):
+                table.move_cursor(row=cursor, animate=False)
+        except Exception:
+            pass
+        self._update_results_stats()
+
+    def _update_results_stats(self) -> None:
+        try:
+            total = len(self._search_results)
+            marked = len(self._marked)
+            if not total:
+                text = "No results yet"
+            elif marked:
+                text = f"Selected: {marked} / {total} tracks"
+            else:
+                text = f"{total} results — highlight a row, press space/m to select"
+            self.query_one("#results_stats", Static).update(text)
+        except Exception:
+            pass
+
+    def _marked_indexes(self) -> list[int]:
+        return sorted(i for i in self._marked if 0 <= i < len(self._search_results))
+
+    def _selected_items(self) -> list[dict[str, Any]]:
+        return [self._search_results[i] for i in self._marked_indexes()]
+
+    def action_toggle_mark_current(self) -> None:
+        table = self.query_one("#results_table", DataTable)
+        row = table.cursor_row
+        if not isinstance(row, int) or not (0 <= row < len(self._search_results)):
+            self.notify("No highlighted search row to select.", severity="warning")
+            return
+        if row in self._marked:
+            self._marked.discard(row)
+        else:
+            self._marked.add(row)
+        self._refresh_results_table()
+
+    def action_select_all_rows(self) -> None:
+        self._marked = set(range(len(self._search_results)))
+        self._refresh_results_table()
+        self.notify(f"Selected {len(self._marked)} of {len(self._search_results)} rows.")
+
+    def action_unselect_all_rows(self) -> None:
+        count = len(self._marked)
+        self._marked = set()
+        self._refresh_results_table()
+        if count:
+            self.notify("Cleared search selection.")
+
+    def action_space_action(self) -> None:
+        """Space: select on the search results table, play/pause elsewhere."""
+        focused = self.focused
+        if isinstance(focused, DataTable) and focused.id == "results_table":
+            self.action_toggle_mark_current()
+            return
+        self.action_toggle_pause()
+
+    # -- Batch actions -------------------------------------------------------
+
+    def action_add_marked_to_queue(self) -> None:
+        """Append every selected search row to the playback queue."""
+        items = self._selected_items()
+        if not items:
+            self.notify("Nothing selected. Highlight rows and press space/m first.", severity="warning")
+            return
+        was_empty = len(self.player.queue) == 0
+        for item in items:
+            self.player.add_to_queue(item)
+        if was_empty:
+            try:
+                video_enabled = self.query_one("#video_toggle", Switch).value
+                self.player.play_index(0, video_enabled=video_enabled)
+            except Exception:
+                pass
+        self._refresh_queue_list()
+        self._update_player_bar()
+        self.notify(f"Added {len(items)} selected track(s) to the queue.")
+
+    def _pick_download_urls(self) -> list[str]:
+        """Selected rows, else the highlighted row, else the typed URL."""
+        urls = [str(it.get("url") or "") for it in self._selected_items()]
+        urls = [u for u in urls if u]
+        if urls:
+            return urls
+        try:
+            table = self.query_one("#results_table", DataTable)
+            row = table.cursor_row
+            if isinstance(row, int) and 0 <= row < len(self._search_results):
+                url = str(self._search_results[row].get("url") or "")
+                if url:
+                    return [url]
+        except Exception:
+            pass
+        url = self.query_one("#search_input", Input).value.strip()
+        if url:
+            return [url]
+        return []
+
+    def action_download_selected(self) -> None:
+        self._action_download_selected()
+
+    def _action_download_selected(self) -> None:
+        """Download selected rows (falling back to the highlighted row / URL).
+
+        One @work(thread=True) worker per track keeps the event loop free.
+        """
+        urls = self._pick_download_urls()
+        if not urls:
+            self.notify("Select search rows (space/m) or enter a URL to download.", severity="warning")
+            return
         preset_id = str(self.query_one("#quality_select", Select).value)
-        self.download_worker(url, preset_id)
+        if len(urls) > 1:
+            self.notify(f"Downloading {len(urls)} track(s) in the background…")
+        for url in urls:
+            self.download_worker(url, preset_id)
+
+    # -- Settings / config (file I/O always on worker threads) ----------------
+
+    @work(thread=True)
+    def config_load_worker(self) -> None:
+        try:
+            settings = config.load_config()
+            self.post_message(ConfigLoaded(settings))
+        except Exception:
+            pass
+
+    @work(thread=True)
+    def config_save_worker(self, settings: dict[str, Any]) -> None:
+        try:
+            config.save_config(settings)
+        except Exception as e:
+            self._run_on_ui_thread(self.notify, f"Could not save settings: {e}", severity="error")
+
+    def on_config_loaded(self, event: ConfigLoaded) -> None:
+        try:
+            self._apply_settings(event.settings, startup=True)
+        except Exception:
+            pass
+
+    def _apply_settings(self, settings: dict[str, Any], startup: bool = False) -> None:
+        """Merge ``settings`` and apply the actionable parts.
+
+        With ``startup=True`` (boot config load) the thumbnail/visualizer boxes
+        are set to their saved startup states; an in-app save persists those
+        toggles but leaves the boxes as the user currently has them.
+        """
+        merged = dict(self._settings)
+        merged.update(dict(settings))
+        self._settings = merged
+        try:
+            self._search_count = int(merged.get("search_results_count", 10))
+        except (TypeError, ValueError):
+            self._search_count = 10
+        self._search_history = list(merged.get("search_history") or [])
+        try:
+            self._toast_duration = float(merged.get("toast_duration", 3.0))
+        except (TypeError, ValueError):
+            self._toast_duration = 3.0
+
+        try:
+            default_fmt = str(merged.get("default_format", "best_video"))
+            preset_ids = [p["id"] for p in self.downloader.get_preset_formats()]
+            if default_fmt not in preset_ids and preset_ids:
+                default_fmt = preset_ids[0]
+            self.query_one("#quality_select", Select).value = default_fmt
+        except Exception:
+            pass
+
+        out_dir = os.path.expanduser(str(merged.get("download_dir") or ""))
+        if out_dir:
+            try:
+                self.downloader.set_download_dir(out_dir)
+            except Exception:
+                pass
+
+        startup_cfg = merged.get("startup") or {}
+        if startup:
+            try:
+                self.query_one("#thumbnail_box").display = bool(startup_cfg.get("thumbnails", False))
+                self.query_one("#visualizer_box").display = bool(startup_cfg.get("visualizer", False))
+                if bool(startup_cfg.get("thumbnails", False)):
+                    self._update_highlighted_thumbnail()
+            except Exception:
+                pass
+
+        try:
+            self.player.autoplay_next = bool(startup_cfg.get("autoplay_next", True))
+        except Exception:
+            pass
+
+        self._update_results_stats()
+
+    # -- Search history -------------------------------------------------------
+
+    def _remember_search(self) -> None:
+        try:
+            query = self.query_one("#search_input", Input).value.strip()
+        except Exception:
+            query = ""
+        if not query:
+            return
+        hist = list(self._search_history)
+        if hist and hist[-1] == query:
+            return
+        if query in hist:
+            hist.remove(query)
+        hist.append(query)
+        self._search_history = hist[-config.MAX_HISTORY :]
+        self._hist_index = None
+        if not self._load_config_file:
+            return
+        settings = dict(self._settings)
+        settings["search_history"] = list(self._search_history)
+        self.config_save_worker(settings)
+
+    def _cycle_search_history(self, direction: int) -> None:
+        hist = self._search_history
+        if not hist:
+            self.notify("No previous searches yet.", severity="warning")
+            return
+        if self._hist_index is None:
+            self._hist_index = len(hist)
+        target = (self._hist_index or 0) + direction
+        if target < 0:
+            target = 0
+        if target >= len(hist):
+            self._hist_index = None  # past the newest entry: back to typed text
+            return
+        self._hist_index = target
+        query = hist[target]
+        try:
+            input_box = self.query_one("#search_input", Input)
+            input_box.value = query
+            input_box.cursor_position = len(query)
+        except Exception:
+            pass
+
+    # -- Queue export / import ------------------------------------------------
+
+    def action_export_queue(self) -> None:
+        items = self.player.snapshot_items()
+        if not items:
+            self.notify("Queue is empty — nothing to export.", severity="warning")
+            return
+        out_dir = os.path.expanduser(str(self._settings.get("download_dir") or "")) or os.getcwd()
+        self.export_queue_worker(items, out_dir)
+
+    @work(thread=True)
+    def export_queue_worker(self, items: list[dict[str, Any]], out_dir: str) -> None:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            base = os.path.join(out_dir, f"{config.QUEUE_EXPORT_PREFIX}{stamp}")
+            with open(base + ".json", "w", encoding="utf-8") as fh:
+                fh.write(_queue_to_json(items))
+            with open(base + ".m3u", "w", encoding="utf-8") as fh:
+                fh.write(_queue_to_m3u(items))
+            self._run_on_ui_thread(
+                self.notify,
+                f"Exported {len(items)} track(s) → {base}.json",
+                severity="information",
+            )
+        except Exception as e:
+            self._run_on_ui_thread(self.notify, f"Export failed: {e}", severity="error")
+
+    def action_import_queue(self) -> None:
+        in_dir = os.path.expanduser(str(self._settings.get("download_dir") or "")) or os.getcwd()
+        self.import_queue_worker(in_dir)
+
+    @work(thread=True)
+    def import_queue_worker(self, in_dir: str) -> None:
+        try:
+            os.makedirs(in_dir, exist_ok=True)
+            candidates: list[str] = []
+            for fname in os.listdir(in_dir):
+                if fname.startswith(config.QUEUE_EXPORT_PREFIX):
+                    candidates.append(os.path.join(in_dir, fname))
+            candidates.sort(key=os.path.getmtime, reverse=True)
+            if not candidates:
+                self._run_on_ui_thread(
+                    self.notify,
+                    "No ytcli-queue-* files found in the download directory.",
+                    severity="warning",
+                )
+                return
+            chosen = candidates[0]
+            with open(chosen, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            ext = os.path.splitext(chosen)[1].lower()
+            if ext == ".m3u":
+                items = _parse_m3u_text(text)
+            else:
+                try:
+                    data = json.loads(text)
+                    items = data if isinstance(data, list) else (data.get("items") if isinstance(data, dict) else [])
+                except json.JSONDecodeError:
+                    items = _parse_m3u_text(text)
+            if not isinstance(items, list):
+                items = []
+            self.post_message(QueueImportReady(items, chosen))
+        except Exception as e:
+            self._run_on_ui_thread(self.notify, f"Import failed: {e}", severity="error")
+
+    def on_queue_import_ready(self, event: QueueImportReady) -> None:
+        try:
+            if not event.items:
+                self.notify(f"No playable entries in {os.path.basename(event.source)}.", severity="warning")
+                return
+            was_active = self.player.is_playing or self.player.is_paused
+            count = self.player.load_items(event.items)
+            if was_active:
+                self.player.stop()
+            self._refresh_queue_list()
+            self._update_player_bar()
+            self.notify(f"Imported {count} track(s) from {os.path.basename(event.source)}.")
+        except Exception as e:
+            self.notify(f"Import error: {e}", severity="error")
+
+    # -- Settings modal -------------------------------------------------------
+
+    def action_toggle_settings(self) -> None:
+        try:
+            preset_options = [(p["label"], p["id"]) for p in self.downloader.get_preset_formats()]
+            self.push_screen(SettingsScreen(self._settings, preset_options), self._on_settings_dismissed)
+        except Exception as e:
+            self.notify(f"Could not open settings: {e}", severity="error")
+
+    def _on_settings_dismissed(self, result: Optional[dict[str, Any]]) -> None:
+        if not isinstance(result, dict):
+            return
+        try:
+            self._apply_settings(result, startup=False)
+            settings = dict(self._settings)
+            settings["search_history"] = list(self._search_history)
+            self.config_save_worker(settings)
+            self.notify("Settings saved.", severity="information")
+        except Exception as e:
+            self.notify(f"Could not apply settings: {e}", severity="error")
 
     @work(thread=True)
     def download_worker(self, url: str, preset_id: str) -> None:
@@ -712,15 +1339,12 @@ class YTPlayerApp(App):
     # Textual Message Event Handlers
     def on_search_results_ready(self, event: SearchResultsReady) -> None:
         self._search_results = event.results
-        table = self.query_one("#results_table", DataTable)
-        table.clear()
-        for idx, item in enumerate(self._search_results):
-            title = item.get("title", "Unknown Title")
-            dur = float(item.get("duration") or 0.0)
-            dur_str = format_time(dur) if dur > 0 else "--:--"
-            uploader = item.get("uploader", "Unknown")
-            table.add_row(str(idx + 1), title, dur_str, uploader, key=str(idx))
-        self.notify(f"Found {len(self._search_results)} items. Select a row to play.")
+        # A fresh result set invalidates marks tied to the previous rows.
+        self._marked = set()
+        # Remember the query (debounced history write) before rebuilding.
+        self._remember_search()
+        self._refresh_results_table()
+        self.notify(f"Found {len(self._search_results)} items. Highlight a row to play.")
 
     def on_track_changed(self, event: TrackChanged) -> None:
         self._refresh_queue_list()
@@ -980,6 +1604,24 @@ class YTPlayerApp(App):
         self._update_player_bar()
         self.notify(f"Volume: {vol}%")
 
+    def action_arrow_up(self) -> None:
+        """Up: recall the previous search when typing; else volume up."""
+        if self._arrow_focuses_search():
+            self._cycle_search_history(-1)
+            return
+        self.action_volume_up()
+
+    def action_arrow_down(self) -> None:
+        """Down: step toward the newest search when typing; else volume down."""
+        if self._arrow_focuses_search():
+            self._cycle_search_history(1)
+            return
+        self.action_volume_down()
+
+    def _arrow_focuses_search(self) -> bool:
+        focused = self.focused
+        return isinstance(focused, Input) and focused.id == "search_input"
+
     def action_toggle_shuffle(self) -> None:
         shuf = self.player.toggle_shuffle()
         self._update_player_bar()
@@ -1209,3 +1851,14 @@ class YTPlayerApp(App):
 
     def on_unmount(self) -> None:
         self.player.cleanup()
+        # Persist current settings (and any search-history additions) when
+        # leaving. Done synchronously because a worker spawned here would not be
+        # guaranteed to finish before the process exits. Skipped when the app was
+        # started without config I/O (tests).
+        if self._load_config_file:
+            try:
+                settings = dict(self._settings)
+                settings["search_history"] = list(self._search_history)
+                config.save_config(settings)
+            except Exception:
+                pass
