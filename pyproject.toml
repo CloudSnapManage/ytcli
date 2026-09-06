@@ -1,21 +1,21 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ytcli"
+name = "ytcli-tui"
 version = "1.0.0"
 description = "A keyboard-driven YouTube client and media player built for the terminal"
 readme = "README.md"
-authors = [
-    { name = "Shrijan Paudel" }
-]
-license = { text = "MIT" }
 requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Shrijan Paudel"}
+]
 dependencies = [
-    "yt-dlp>=2024.0.0",
-    "textual>=0.50.0",
-    "python-mpv>=1.0.5",
+    "textual",
+    "yt-dlp",
+    "python-mpv",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +25,10 @@ thumbnails = [
 
 [project.scripts]
 ytcli = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/CloudSnapManage/ytcli"
+Repository = "https://github.com/CloudSnapManage/ytcli"
 
 [tool.setuptools]
 py-modules = ["config", "main", "player", "terminal_graphics", "ui", "yt_downloader"]

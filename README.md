@@ -59,6 +59,14 @@ brew install python mpv yt-dlp ffmpeg
 
 ## Installation
 
+### PyPI (pip)
+
+Install `ytcli` directly via `pip`:
+
+```bash
+pip install ytcli-tui
+```
+
 ### Fast Install (Recommended)
 
 Install globally in an isolated environment using `pipx`:
