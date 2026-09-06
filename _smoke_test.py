@@ -201,10 +201,30 @@ async def _check_ui_overhaul() -> None:
         await pilot.press("escape")
         assert app.focused == app.query_one("#search_input")
 
+        # Test Up/Down while search_input is focused: volume MUST NOT change
+        assert player.get_volume() == 100
+        await pilot.press("down")
+        assert player.get_volume() == 100
+        await pilot.press("up")
+        assert player.get_volume() == 100
+
+        # Test Up/Down while results_table is focused: volume MUST NOT change
+        results_table.focus()
+        await pilot.pause()
+        assert app.focused == results_table
+        await pilot.press("down")
+        assert player.get_volume() == 100
+
+        # Test Space key while results_table is focused: toggles row selection
+        assert len(app._marked) == 0
+        await pilot.press("space")
+        await pilot.pause()
+        assert len(app._marked) == 1
+
         await pilot.press("escape")
         assert app.focused is None
 
-        # Test Space key play/pause
+        # Test Space key play/pause when table is not focused
         with patch.object(player.mpv, "play"):
             await pilot.press("space")
             await pilot.pause()

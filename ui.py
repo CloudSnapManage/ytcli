@@ -510,11 +510,10 @@ class YTPlayerApp(App):
         Binding("x", "stop", "Stop", priority=True),
         Binding("left", "seek_backward", "Seek -5s", priority=True),
         Binding("right", "seek_forward", "Seek +5s", priority=True),
-        # Up/Down adjust volume everywhere except the search box, where they
-        # recall previous searches. Routed through dispatchers so the behaviour
-        # follows the focused widget (mirrors the contextual space key below).
-        Binding("up", "arrow_up", "Vol ↑ / Search history", priority=True),
-        Binding("down", "arrow_down", "Vol ↓ / Search history", priority=True),
+        # Volume Up/Down are deliberately NOT bound here: bound arrows would
+        # swallow the key before a focused DataTable/Input/OptionList can use it
+        # for navigation. Volume is handled in on_key only when no such widget
+        # owns the key.
         Binding("s", "toggle_shuffle", "Shuffle", priority=True),
         Binding("r", "toggle_repeat", "Repeat", priority=True),
         Binding("t", "toggle_thumbnail", "Thumbnail", priority=True),
@@ -534,7 +533,7 @@ class YTPlayerApp(App):
         Binding("d", "download_selected", "Download Selected"),
         # Power features.
         Binding("S", "toggle_settings", "Settings"),
-        Binding("ctrl+s", "toggle_settings", "Settings"),
+        Binding("ctrl+s", "toggle_settings", "Settings", show=False),
         Binding("ctrl+e", "export_queue", "Export Queue"),
         Binding("ctrl+i", "import_queue", "Import Queue"),
     ]
@@ -605,7 +604,10 @@ class YTPlayerApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#results_table", DataTable)
-        table.add_columns("#", "Title", "Duration", "Artist / Uploader")
+        table.add_column("#", width=6, key="col_num")
+        table.add_column("Title", key="col_title")
+        table.add_column("Duration", width=10, key="col_duration")
+        table.add_column("Artist / Uploader", key="col_uploader")
         detected = detect_terminal_graphics_support().get("protocol")
         # iTerm2's proprietary inline-image OSC is intentionally left on the
         # ANSI fallback (it does not overlay cleanly inside a cell-based TUI).
@@ -672,6 +674,11 @@ class YTPlayerApp(App):
                 self.set_focus(None)
                 event.prevent_default()
                 event.stop()
+            elif focused.id == "search_input" and event.key in ("up", "down"):
+                delta = -1 if event.key == "up" else 1
+                self._cycle_search_history(delta)
+                event.prevent_default()
+                event.stop()
             return
 
         if event.key == "space":
@@ -718,7 +725,7 @@ class YTPlayerApp(App):
             self.action_quit()
             event.prevent_default()
             event.stop()
-        elif event.key in ("up", "down") and not isinstance(focused, (DataTable, OptionList, Select)):
+        elif event.key in ("up", "down") and not isinstance(focused, (DataTable, OptionList, Select, Input)):
             if event.key == "up":
                 self.action_volume_up()
             else:
@@ -846,10 +853,10 @@ class YTPlayerApp(App):
                 cursor = None
             table.clear()
             for idx, item in enumerate(self._search_results):
-                title = str(item.get("title", "Unknown Title"))
+                title = str(item.get("title", "Unknown Title")).replace("\r", " ").replace("\n", " ").strip()
                 dur = float(item.get("duration") or 0.0)
                 dur_str = format_time(dur) if dur > 0 else "--:--"
-                uploader = str(item.get("uploader", "Unknown"))
+                uploader = str(item.get("uploader", "Unknown")).replace("\r", " ").replace("\n", " ").strip()
                 check = "✓ " if idx in self._marked else ""
                 table.add_row(f"{check}{idx + 1}", title, dur_str, uploader, key=str(idx))
             if cursor is not None and 0 <= cursor < len(self._search_results):
@@ -1595,32 +1602,18 @@ class YTPlayerApp(App):
         self.notify(f"Seek {seconds:+.0f}s")
 
     def action_volume_up(self) -> None:
+        if isinstance(self.focused, (DataTable, Input)):
+            return
         vol = self.player.volume_up(5)
         self._update_player_bar()
         self.notify(f"Volume: {vol}%")
 
     def action_volume_down(self) -> None:
+        if isinstance(self.focused, (DataTable, Input)):
+            return
         vol = self.player.volume_down(5)
         self._update_player_bar()
         self.notify(f"Volume: {vol}%")
-
-    def action_arrow_up(self) -> None:
-        """Up: recall the previous search when typing; else volume up."""
-        if self._arrow_focuses_search():
-            self._cycle_search_history(-1)
-            return
-        self.action_volume_up()
-
-    def action_arrow_down(self) -> None:
-        """Down: step toward the newest search when typing; else volume down."""
-        if self._arrow_focuses_search():
-            self._cycle_search_history(1)
-            return
-        self.action_volume_down()
-
-    def _arrow_focuses_search(self) -> bool:
-        focused = self.focused
-        return isinstance(focused, Input) and focused.id == "search_input"
 
     def action_toggle_shuffle(self) -> None:
         shuf = self.player.toggle_shuffle()
@@ -1693,6 +1686,21 @@ class YTPlayerApp(App):
             # Check current playing track
             if self.player.current_track:
                 self._request_thumbnail_update(self.player.current_track)
+                return
+
+            self._render_idle_thumbnail()
+        except Exception:
+            pass
+
+    def _render_idle_thumbnail(self) -> None:
+        try:
+            self._clear_native_overlay()
+            thumb_box = self.query_one("#thumbnail_box")
+            if not thumb_box.display:
+                return
+            placeholder = generate_placeholder_thumbnail("No Media Selected", width=34, height=12)
+            display = self.query_one("#thumbnail_display", Static)
+            display.update(Text.from_ansi(placeholder))
         except Exception:
             pass
 
@@ -1829,7 +1837,7 @@ class YTPlayerApp(App):
             else:
                 if not getattr(self, "_vis_is_flat", False):
                     baseline = " ".join(["▂▂"] * 16)
-                    display.update(f"\n\n\n\n[dim cyan]{baseline}[/dim cyan]")
+                    display.update(f"[dim]Visualizer Idle[/dim]\n\n\n[dim cyan]{baseline}[/dim cyan]")
                     self._vis_is_flat = True
         except Exception:
             pass
